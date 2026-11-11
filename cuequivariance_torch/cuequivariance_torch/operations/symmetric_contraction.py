@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import warnings
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 from cuequivariance.group_theory.experimental.mace.symmetric_contractions import (
@@ -34,12 +35,13 @@ class SymmetricContraction(torch.nn.Module):
     Accelerated implementation of the symmetric contraction operation introduced in https://arxiv.org/abs/2206.07697.
 
     Args:
-        irreps_in (Irreps): The input irreps. All multiplicities (mul) within the irreps must be identical,
-            indicating that each irrep appears the same number of times.
-        irreps_out (Irreps): The output irreps. Similar to `irreps_in`, all multiplicities must be the same.
+        irreps_in (Irreps): The input irreps. Both uniform and non-uniform (tapered)
+            multiplicities are supported via greatest-common-divisor channel grouping.
+        irreps_out (Irreps): The output irreps. Both uniform and non-uniform (tapered)
+            multiplicities are supported.
         contraction_degree (int): The degree of the symmetric contraction, specifying the maximum degree of the
             polynomial in the symmetric contraction.
-        num_elements (int): The number of elements for the weight tensor.
+        num_elements (int, optional): The number of elements for the weight tensor, by default ``1``.
         layout (IrrepsLayout, optional): The layout of the input and output irreps. If not provided, a default layout is used.
         layout_in (IrrepsLayout, optional): The layout of the input irreducible representations, by default ``layout``.
         layout_out (IrrepsLayout, optional): The layout of the output irreducible representations, by default ``layout``.
@@ -99,8 +101,9 @@ class SymmetricContraction(torch.nn.Module):
 
     Note:
         The term 'mul' refers to the multiplicity of an irrep, indicating how many times it appears
-        in the representation. This layer requires that all input and output irreps have the same
-        multiplicity for the symmetric contraction operation to be well-defined.
+        in the representation. Multiplicities across input and output irreps are grouped by their
+        greatest common divisor ``mul_gcd = math.gcd(*irreps_in.muls, *irreps_out.muls)`` so every
+        polynomial segment shares uniform extent ``mul_gcd``.
     """
 
     def __init__(
@@ -108,7 +111,7 @@ class SymmetricContraction(torch.nn.Module):
         irreps_in: cue.Irreps,
         irreps_out: cue.Irreps,
         contraction_degree: int,
-        num_elements: int,
+        num_elements: int = 1,
         *,
         layout: Optional[cue.IrrepsLayout] = None,
         layout_in: Optional[cue.IrrepsLayout] = None,
@@ -122,31 +125,41 @@ class SymmetricContraction(torch.nn.Module):
     ):
         super().__init__()
 
+        if num_elements < 1:
+            raise ValueError(f"num_elements must be >= 1, got {num_elements}")
+
         irreps_in, irreps_out = default_irreps(irreps_in, irreps_out)
         assert_same_group(irreps_in, irreps_out)
         self.contraction_degree = contraction_degree
 
-        if len(set(irreps_in.muls) | set(irreps_out.muls)) != 1:
-            raise ValueError("Input/Output irreps must have the same mul")
-
-        mul = irreps_in.muls[0]
+        all_muls = [*irreps_in.muls, *irreps_out.muls]
+        mul_gcd = math.gcd(*all_muls) if all_muls else 1
+        if mul_gcd == 0:
+            mul_gcd = 1
+        self.mul_gcd = mul_gcd
 
         self.irreps_in = irreps_in
         self.irreps_out = irreps_out
+        self.irreps_in_dim: int = irreps_in.dim
+        self.irreps_out_dim: int = irreps_out.dim
 
         self.etp, p = symmetric_contraction(
             irreps_in, irreps_out, range(1, contraction_degree + 1)
         )
         same_shape = self.etp.all_same_segment_shape()
 
+        effective_dtype = dtype if dtype is not None else torch.get_default_dtype()
         if original_mace:
-            self.register_buffer(
-                "projection", torch.tensor(p, dtype=dtype, device=device)
+            proj_dtype = (
+                torch.float64 if effective_dtype == torch.float64 else torch.float32
             )
-            self.weight_shape = (p.shape[0], mul)
+            self.register_buffer(
+                "projection", torch.tensor(p, dtype=proj_dtype, device=device)
+            )
+            self.weight_shape = (p.shape[0], mul_gcd)
         else:
             self.projection = None
-            self.weight_shape = (self.etp.inputs[0].dim // mul, mul)
+            self.weight_shape = (self.etp.inputs[0].dim // mul_gcd, mul_gcd)
 
         self.num_elements = num_elements
         self.weight = torch.nn.Parameter(
@@ -209,6 +222,7 @@ class SymmetricContraction(torch.nn.Module):
             math_dtype=math_dtype,
         ).to(device)
 
+    @torch.jit.ignore
     def extra_repr(self) -> str:
         return (
             f"contraction_degree={self.contraction_degree}"
@@ -218,25 +232,74 @@ class SymmetricContraction(torch.nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        indices: torch.Tensor,
+        indices: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Perform the forward pass of the symmetric contraction operation.
 
         Args:
-            x (torch.Tensor): The input tensor. It should have shape (batch, irreps_in.dim).
-            indices (torch.Tensor): The index of the weight to use for each batch element.
-                It should have shape (batch,).
+            x (torch.Tensor): The input tensor of shape ``(*batch, irreps_in.dim)``.
+            indices (torch.Tensor, optional): The index of the weight to use for each batch element,
+                of shape ``(*batch,)``. Optional when ``num_elements == 1``.
+            mask (torch.Tensor, optional): Boolean mask of shape ``(*batch,)`` where ``True`` marks
+                valid elements and ``False`` marks padded/masked elements whose outputs are zeroed.
 
         Returns:
-            torch.Tensor: The output tensor. It has shape (batch, irreps_out.dim).
+            torch.Tensor: The output tensor of shape ``(*batch, irreps_out.dim)``.
         """
+        if x.ndim < 1 or x.shape[-1] != self.irreps_in_dim:
+            raise ValueError(
+                f"Expected x to have last dimension {self.irreps_in_dim}, got shape {x.shape}"
+            )
+
+        batch_shape = list(x.shape[:-1])
+        mask_bool: Optional[torch.Tensor] = None
+        if mask is not None:
+            if list(mask.shape) != batch_shape:
+                raise ValueError(
+                    f"Expected mask to have shape {batch_shape}, got {list(mask.shape)}"
+                )
+            mask_bool = mask if mask.dtype == torch.bool else mask.to(dtype=torch.bool)
+            x = torch.where(mask_bool.unsqueeze(-1), x, torch.zeros_like(x))
 
         if self.projection is not None:
-            weight = torch.einsum("zau,ab->zbu", self.weight, self.projection)
+            proj_dtype = (
+                torch.float64
+                if (
+                    self.weight.dtype == torch.float64
+                    or self.projection.dtype == torch.float64
+                )
+                else torch.float32
+            )
+            weight = torch.einsum(
+                "...au,ab->...bu",
+                self.weight.to(dtype=proj_dtype),
+                self.projection.to(dtype=proj_dtype),
+            ).to(dtype=self.weight.dtype)
         else:
             weight = self.weight
         weight = weight.flatten(1)
 
-        output = self.f([weight, self.transpose_in(x)], input_indices={0: indices})
-        return self.transpose_out(output[0])
+        x_flat = self.transpose_in(x.reshape(-1, self.irreps_in_dim))
+
+        input_indices: Dict[int, torch.Tensor] = {}
+        if indices is None:
+            if self.num_elements != 1:
+                raise ValueError(
+                    f"indices must be provided when num_elements != 1 (got num_elements={self.num_elements})"
+                )
+        else:
+            if list(indices.shape) != batch_shape:
+                raise ValueError(
+                    f"Expected indices to have shape {batch_shape}, got {list(indices.shape)}"
+                )
+            if mask_bool is not None:
+                indices = torch.where(mask_bool, indices, torch.zeros_like(indices))
+            input_indices[0] = indices.reshape(-1)
+
+        output = self.f([weight, x_flat], input_indices=input_indices)
+        out = self.transpose_out(output[0]).reshape(batch_shape + [self.irreps_out_dim])
+        if mask_bool is not None:
+            out = torch.where(mask_bool.unsqueeze(-1), out, torch.zeros_like(out))
+        return out
