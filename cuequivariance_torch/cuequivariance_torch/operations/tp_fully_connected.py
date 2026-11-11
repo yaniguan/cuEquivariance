@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 from cuequivariance.group_theory.irreps_array.misc_ui import (
@@ -168,40 +168,119 @@ class FullyConnectedTensorProduct(torch.nn.Module):
         x1: torch.Tensor,
         x2: torch.Tensor,
         weight: Optional[torch.Tensor] = None,
+        indices_1: Optional[torch.Tensor] = None,
+        indices_2: Optional[torch.Tensor] = None,
+        indices_out: Optional[torch.Tensor] = None,
+        size_out: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Perform the forward pass of the fully connected tensor product operation.
 
         Args:
-            x1 (torch.Tensor): Input tensor for the first operand. It should have the shape (batch_size, irreps_in1.dim).
-            x2 (torch.Tensor): Input tensor for the second operand. It should have the shape (batch_size, irreps_in2.dim).
+            x1 (torch.Tensor): Input tensor for the first operand. It should have the shape (batch_size, irreps_in1.dim)
+                or (num_nodes_1, irreps_in1.dim) when ``indices_1`` is provided.
+            x2 (torch.Tensor): Input tensor for the second operand. It should have the shape (batch_size, irreps_in2.dim)
+                or (num_nodes_2, irreps_in2.dim) when ``indices_2`` is provided.
             weight (torch.Tensor, optional): Weights for the tensor product. It should have the shape (batch_size, weight_numel)
-                if shared_weights is False, or (weight_numel,) if shared_weights is True.
+                if shared_weights is False, or (1, weight_numel) / (weight_numel,) if shared_weights is True.
                 If None, the internal weights are used.
+            indices_1 (torch.Tensor, optional): 1D integer indices to gather elements from ``x1``.
+            indices_2 (torch.Tensor, optional): 1D integer indices to gather elements from ``x2``.
+            indices_out (torch.Tensor, optional): 1D integer indices to sum-scatter elements into the output.
+            size_out (int, optional): First dimension size of the output. Required when ``indices_out`` is provided.
 
         Returns:
             torch.Tensor:
                 Output tensor resulting from the fully connected tensor product operation.
-                It will have the shape (batch_size, irreps_out.dim).
+                It will have the shape (size_out, irreps_out.dim) if ``indices_out`` is provided,
+                otherwise (batch_size, irreps_out.dim).
 
         Raises:
             ValueError: If internal weights are used and weight is not None,
-                or if shared weights are used and weight is not a 1D tensor,
-                or if shared weights are not used and weight is not a 2D tensor.
+                or if internal weights are not used and weight is None,
+                or if ``indices_out`` is provided without ``size_out``.
         """
         x1 = self.transpose_in1(x1)
         x2 = self.transpose_in2(x2)
 
+        need_i64 = self.f.method in ("naive", "fused_tp") or x1.device.type == "cpu"
+
+        indices_in: Dict[int, torch.Tensor] = {}
+        if indices_1 is not None:
+            if indices_1.dtype not in (torch.int32, torch.int64):
+                raise ValueError("indices_1 must be int32 or int64")
+            indices_in[1] = indices_1.to(torch.int64) if need_i64 else indices_1
+        if indices_2 is not None:
+            if indices_2.dtype not in (torch.int32, torch.int64):
+                raise ValueError("indices_2 must be int32 or int64")
+            indices_in[2] = indices_2.to(torch.int64) if need_i64 else indices_2
+
+        dict_indices_out: Dict[int, torch.Tensor] = {}
+        sizes_out: Dict[int, torch.Tensor] = {}
+        if indices_out is not None:
+            if size_out is None:
+                raise ValueError(
+                    "size_out should be provided if indices_out is provided"
+                )
+            if indices_out.dtype not in (torch.int32, torch.int64):
+                raise ValueError("indices_out must be int32 or int64")
+            idx_out = indices_out.to(torch.int64) if need_i64 else indices_out
+            dict_indices_out = {0: idx_out}
+            sizes_out = {0: torch.empty((size_out, 1), device=x1.device)}
+
         if self.weight is not None:
             if weight is not None:
                 raise ValueError("Internal weights are used, weight should be None")
-            output = self.f([self.weight, x1, x2])
+            weight_tensor = self.weight
         else:
             if weight is None:
                 raise ValueError(
                     "Internal weights are not used, weight should not be None"
                 )
-            else:
-                output = self.f([weight, x1, x2])
+            weight_tensor = weight
+
+        if (
+            indices_out is not None
+            and size_out is not None
+            and indices_out.numel() == 0
+        ):
+            for idx_t in (indices_1, indices_2, indices_out):
+                if idx_t is not None:
+                    if idx_t.dim() != 1:
+                        raise ValueError("Index tensor must be one-dimensional")
+                    if idx_t.dtype not in (torch.int32, torch.int64):
+                        raise ValueError("Index tensor must be int32 or int64")
+            if weight_tensor.shape[-1] != self.weight_numel:
+                raise ValueError(
+                    f"Expected weight last dim {self.weight_numel}, got {weight_tensor.shape[-1]}"
+                )
+            if x1.shape[-1] != self.irreps_in1.dim:
+                raise ValueError(
+                    f"Expected x1 last dim {self.irreps_in1.dim}, got {x1.shape[-1]}"
+                )
+            if x2.shape[-1] != self.irreps_in2.dim:
+                raise ValueError(
+                    f"Expected x2 last dim {self.irreps_in2.dim}, got {x2.shape[-1]}"
+                )
+            zero_anchor = (
+                (weight_tensor * weight_tensor).sum()
+                + (x1 * x1).sum().to(weight_tensor.dtype)
+                + (x2 * x2).sum().to(weight_tensor.dtype)
+            ) * 0.0
+            return (
+                torch.zeros(
+                    (size_out, self.irreps_out.dim),
+                    dtype=weight_tensor.dtype,
+                    device=x1.device,
+                )
+                + zero_anchor
+            )
+
+        output = self.f(
+            [weight_tensor, x1, x2],
+            input_indices=indices_in,
+            output_shapes=sizes_out,
+            output_indices=dict_indices_out,
+        )
 
         return self.transpose_out(output[0])

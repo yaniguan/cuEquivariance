@@ -165,3 +165,64 @@ def test_export(
     m1 = module_with_mode(mode, m1, inputs, dtype, tmp_path)
     out2 = m1(*inputs)
     torch.testing.assert_close(out1, out2)
+
+
+@pytest.mark.parametrize("layout", [cue.ir_mul, cue.mul_ir])
+@pytest.mark.parametrize("shared_weights", [True, False])
+@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
+def test_fully_connected_indexing(
+    layout: cue.IrrepsLayout,
+    shared_weights: bool,
+    index_dtype: torch.dtype,
+):
+    torch.manual_seed(0)
+    irreps1 = cue.Irreps("O3", "3x0e + 2x1o")
+    irreps2 = cue.Irreps("O3", "0e + 1o")
+    irreps3 = cue.Irreps("O3", "3x0e + 2x1o")
+
+    m = cuet.FullyConnectedTensorProduct(
+        irreps1,
+        irreps2,
+        irreps3,
+        shared_weights=shared_weights,
+        internal_weights=False,
+        layout=layout,
+        device=device,
+        dtype=torch.float64,
+        method="naive",
+    )
+
+    num_src, num_dst, num_edges = 6, 8, 15
+    x1 = torch.randn(
+        num_src, irreps1.dim, device=device, dtype=torch.float64, requires_grad=True
+    )
+    x2 = torch.randn(
+        num_edges, irreps2.dim, device=device, dtype=torch.float64, requires_grad=True
+    )
+    w_batch = 1 if shared_weights else num_edges
+    w = torch.randn(
+        w_batch, m.weight_numel, device=device, dtype=torch.float64, requires_grad=True
+    )
+    src = torch.randint(0, num_src, (num_edges,), device=device, dtype=index_dtype)
+    dst = torch.randint(0, num_dst - 2, (num_edges,), device=device, dtype=index_dtype)
+
+    out_indexed = m(x1, x2, w, indices_1=src, indices_out=dst, size_out=num_dst)
+
+    out_edge = m(x1[src.to(torch.int64)], x2, w)
+    out_ref = torch.zeros(
+        (num_dst, irreps3.dim), device=device, dtype=torch.float64
+    ).scatter_add(0, dst.to(torch.int64).unsqueeze(-1).expand_as(out_edge), out_edge)
+
+    torch.testing.assert_close(out_indexed, out_ref, atol=1e-12, rtol=1e-12)
+
+    g_idx = torch.autograd.grad(
+        out_indexed.pow(2).sum(), (x1, x2, w), create_graph=True
+    )
+    g_ref = torch.autograd.grad(out_ref.pow(2).sum(), (x1, x2, w), create_graph=True)
+    for gi, gr in zip(g_idx, g_ref):
+        torch.testing.assert_close(gi, gr, atol=1e-12, rtol=1e-12)
+
+    gg_idx = torch.autograd.grad(sum(g.pow(2).sum() for g in g_idx), (x1, x2, w))
+    gg_ref = torch.autograd.grad(sum(g.pow(2).sum() for g in g_ref), (x1, x2, w))
+    for ggi, ggr in zip(gg_idx, gg_ref):
+        torch.testing.assert_close(ggi, ggr, atol=1e-12, rtol=1e-12)
