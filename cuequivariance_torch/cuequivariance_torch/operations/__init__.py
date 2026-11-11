@@ -13,6 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .cartesian_tensor import CartesianToIrreps, IrrepsToCartesian
+from .fp8_equivariant import (
+    EquivariantFP8Linear,
+    irrep_fp8_dequantize,
+    irrep_fp8_quantize,
+    irrep_fp8_ste,
+)
 from .gate import Gate
 from .linear import Linear
 from .rotation import (
@@ -28,6 +34,12 @@ from .spherical_harmonics import SphericalHarmonics
 from .symmetric_contraction import SymmetricContraction
 from .tp_channel_wise import ChannelWiseTensorProduct
 from .tp_fully_connected import FullyConnectedTensorProduct
+from .virial import (
+    ConservativeVirialStress,
+    apply_cell_strain,
+    compute_forces_and_virial,
+    decompose_stress_irreps,
+)
 
 __all__ = [
     "Gate",
@@ -45,4 +57,12 @@ __all__ = [
     "SphericalHarmonics",
     "CartesianToIrreps",
     "IrrepsToCartesian",
+    "irrep_fp8_quantize",
+    "irrep_fp8_dequantize",
+    "irrep_fp8_ste",
+    "EquivariantFP8Linear",
+    "apply_cell_strain",
+    "compute_forces_and_virial",
+    "decompose_stress_irreps",
+    "ConservativeVirialStress",
 ]

@@ -47,6 +47,18 @@ from .operations.rotation import (
 from .operations.spherical_harmonics import SphericalHarmonics
 from .operations.cartesian_tensor import CartesianToIrreps, IrrepsToCartesian
 from .operations.gate import Gate
+from .operations.fp8_equivariant import (
+    irrep_fp8_quantize,
+    irrep_fp8_dequantize,
+    irrep_fp8_ste,
+    EquivariantFP8Linear,
+)
+from .operations.virial import (
+    apply_cell_strain,
+    compute_forces_and_virial,
+    decompose_stress_irreps,
+    ConservativeVirialStress,
+)
 from .layers.equivariant_norm import EquivariantRMSNorm, EquivariantLayerNorm
 from .primitives.triangle import (
     mask_to_kv_lengths,
@@ -112,6 +124,14 @@ __all__ = [
     "Gate",
     "EquivariantRMSNorm",
     "EquivariantLayerNorm",
+    "irrep_fp8_quantize",
+    "irrep_fp8_dequantize",
+    "irrep_fp8_ste",
+    "EquivariantFP8Linear",
+    "apply_cell_strain",
+    "compute_forces_and_virial",
+    "decompose_stress_irreps",
+    "ConservativeVirialStress",
     "mask_to_kv_lengths",
     "triangle_attention",
     "triangle_multiplicative_update",
