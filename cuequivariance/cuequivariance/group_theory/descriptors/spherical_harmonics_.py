@@ -74,10 +74,11 @@ def spherical_harmonics(
         │  []·a[]➜B[] ───── num_paths=3
         ╰─ []·a[]·a[]➜B[] ─ num_paths=11
     """
+    layout = cue.IrrepsLayout.as_layout(layout)
     poly, irreps_out = _spherical_harmonics_core(ir_vec, ls)
     return cue.EquivariantPolynomial(
-        [cue.IrrepsAndLayout(cue.Irreps(ir_vec), cue.ir_mul)],
-        [cue.IrrepsAndLayout(irreps_out, cue.ir_mul)],
+        [cue.IrrepsAndLayout(cue.Irreps(ir_vec), layout)],
+        [cue.IrrepsAndLayout(irreps_out, layout)],
         poly,
     )
 

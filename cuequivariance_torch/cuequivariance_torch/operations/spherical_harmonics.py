@@ -34,6 +34,7 @@ class SphericalHarmonics(nn.Module):
         math_dtype: Optional[str | torch.dtype] = None,
         use_fallback: Optional[bool] = None,
         method: Optional[str] = None,
+        eps: float = 0.0,
     ):
         """
         Args:
@@ -46,13 +47,19 @@ class SphericalHarmonics(nn.Module):
             use_fallback (bool, optional, deprecated): Whether to use a "fallback" implementation, now maps to method:
                 If `True` the "naive" method is used.
                 If `False` or None (default) the "uniform_1d" method is used.
+            eps (float, optional): Non-negative squared-norm regularization added when ``normalize=True``.
+                Defaults to ``0.0`` (exact zero-safe normalization with zero 1st and 2nd derivatives at the origin).
         """
         super().__init__()
         self.ls = ls if isinstance(ls, list) else [ls]
         assert self.ls == sorted(set(self.ls))
+        if not (eps >= 0.0):
+            raise ValueError(f"`eps` must be non-negative, got {eps}")
         self.normalize = normalize
+        self.eps = float(eps)
 
         e = descriptors.spherical_harmonics(cue.SO3(1), self.ls)
+        self.out_dim: int = e.outputs[0].dim
 
         if method is None:
             if use_fallback is None:
@@ -73,21 +80,79 @@ class SphericalHarmonics(nn.Module):
             math_dtype=math_dtype,
         ).to(device)
 
-    def forward(self, vectors: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        vectors: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
-            vectors (torch.Tensor): Input vectors of shape (batch, 3).
+            vectors (torch.Tensor): Input vectors of shape ``(*batch_dims, 3)``.
+            mask (torch.Tensor, optional): Optional boolean or floating mask broadcastable
+                to ``vectors.shape[:-1]``. Masked-out slots (``False`` or ``0``) are sanitized
+                before normalization and polynomial evaluation and zeroed across all output
+                channels (including ``l = 0``).
 
         Returns:
-            torch.Tensor: The spherical harmonics of the input vectors of shape (batch, dim),
-            where dim is the sum of 2*l+1 for l in ls.
+            torch.Tensor: The spherical harmonics of the input vectors of shape ``(*batch_dims, dim)``,
+            where ``dim`` is the sum of ``2*l+1`` for ``l`` in ``ls``.
         """
-        torch._assert(
-            vectors.ndim == 2, f"Input must have shape (batch, 3) - got {vectors.shape}"
-        )
+        is_fx_tracing = False
+        if not torch.jit.is_scripting():
+            fx = getattr(torch, "fx", None)
+            if fx is not None:
+                symbolic_trace = getattr(fx, "_symbolic_trace", None)
+                if symbolic_trace is not None:
+                    is_fx_tracing = getattr(
+                        symbolic_trace, "is_fx_symbolic_tracing", bool
+                    )()
+
+        if not is_fx_tracing:
+            torch._assert(
+                vectors.ndim >= 1,
+                "Input vectors must have shape (*batch_dims, 3)",
+            )
+            torch._assert(
+                vectors.shape[-1] == 3,
+                "Input vectors last dimension must have size 3",
+            )
+
+        mask_bool: Optional[torch.Tensor] = None
+        if mask is not None:
+            mask_bool = mask.to(dtype=torch.bool).expand(vectors.shape[:-1])
+            vectors = torch.where(
+                mask_bool.unsqueeze(-1), vectors, torch.zeros_like(vectors)
+            )
 
         if self.normalize:
-            vectors = torch.nn.functional.normalize(vectors, dim=1)
+            sq_norm = torch.sum(vectors * vectors, dim=-1, keepdim=True)
+            if self.eps > 0.0:
+                sq_norm = sq_norm + self.eps
+            is_zero = sq_norm == 0.0
+            safe_sq = torch.where(is_zero, torch.ones_like(sq_norm), sq_norm)
+            inv_norm = torch.rsqrt(safe_sq)
+            vectors = torch.where(
+                is_zero, torch.zeros_like(vectors), vectors * inv_norm
+            )
 
-        [output] = self.f([vectors])
+        if torch.jit.is_scripting():
+            out_shape = vectors.shape[:-1] + [self.out_dim]
+        else:
+            out_shape = vectors.shape[:-1] + (self.out_dim,)
+
+        vectors_2d = vectors.reshape(-1, 3)
+        if not is_fx_tracing and vectors_2d.shape[0] == 0:
+            output_2d = vectors_2d.sum(dim=-1, keepdim=True) * vectors_2d.new_zeros(
+                (0, self.out_dim)
+            )
+        else:
+            output_2d = self.f([vectors_2d])[0]
+
+        output = output_2d.reshape(out_shape)
+
+        if mask_bool is not None:
+            output = torch.where(
+                mask_bool.unsqueeze(-1), output, torch.zeros_like(output)
+            )
+
         return output
