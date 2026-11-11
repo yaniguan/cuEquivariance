@@ -59,6 +59,8 @@ class FullyConnectedTensorProductConv(nn.Module):
         use_fallback (bool, optional): If `None` (default), a CUDA kernel will be used if available.
                 If `False`, a CUDA kernel will be used, and an exception is raised if it's not available.
                 If `True`, a PyTorch fallback method is used regardless of CUDA kernel availability.
+        method (str, optional): Backend method forwarded to :class:`cuequivariance_torch.FullyConnectedTensorProduct`
+            (e.g., ``"fused_tp"``, ``"naive"``). Defaults to ``None``.
 
     Examples:
         >>> in_irreps = cue.Irreps("O3", "4x0e + 4x1o")
@@ -105,6 +107,7 @@ class FullyConnectedTensorProductConv(nn.Module):
         mlp_activation: Union[nn.Module, Sequence[nn.Module], None] = nn.GELU(),
         layout: cue.IrrepsLayout = None,  # e3nn_compat_mode
         use_fallback: Optional[bool] = None,
+        method: Optional[str] = None,
     ):
         super().__init__()
 
@@ -125,6 +128,7 @@ class FullyConnectedTensorProductConv(nn.Module):
             layout=self.layout,
             shared_weights=False,
             use_fallback=use_fallback,
+            method=method,
         )
 
         self.batch_norm = (
@@ -228,21 +232,45 @@ class FullyConnectedTensorProductConv(nn.Module):
                 tp_weights = edge_emb @ w_edge.T + self.mlp[0].bias
 
                 if src_scalars is not None:
-                    tp_weights += (src_scalars @ w_src.T)[src]
+                    tp_weights = tp_weights + (src_scalars @ w_src.T)[src]
 
                 if dst_scalars is not None:
-                    tp_weights += (dst_scalars @ w_dst.T)[dst]
+                    tp_weights = tp_weights + (dst_scalars @ w_dst.T)[dst]
 
                 tp_weights = self.mlp[1:](tp_weights)
         else:
             tp_weights = edge_emb
 
-        out = self.tp(src_features[src], edge_sh, tp_weights)
-
         if edge_envelope is not None:
-            out = out * edge_envelope.view(-1, 1)
+            tp_weights = tp_weights * edge_envelope.reshape(tp_weights.shape[0], 1).to(
+                tp_weights.dtype
+            )
 
-        out = scatter_reduce(out, dst, dim=0, dim_size=num_dst_nodes, reduce=reduce)
+        out = self.tp(
+            src_features,
+            edge_sh,
+            tp_weights,
+            indices_1=src,
+            indices_out=dst,
+            size_out=num_dst_nodes,
+        )
+
+        if reduce == "mean":
+            deg_dtype = (
+                torch.float32
+                if out.dtype in (torch.float16, torch.bfloat16)
+                else out.dtype
+            )
+            deg = (
+                torch.zeros((num_dst_nodes, 1), dtype=deg_dtype, device=out.device)
+                .scatter_add_(
+                    0,
+                    dst.to(torch.int64).unsqueeze(-1),
+                    torch.ones((dst.shape[0], 1), dtype=deg_dtype, device=out.device),
+                )
+                .clamp_min(1.0)
+            )
+            out = (out.to(deg_dtype) / deg).to(out.dtype)
 
         if self.batch_norm:
             out = self.batch_norm(out)
@@ -252,7 +280,7 @@ class FullyConnectedTensorProductConv(nn.Module):
 
 def broadcast(src: torch.Tensor, ref: torch.Tensor, dim: int) -> torch.Tensor:
     size = ((1,) * dim) + (-1,) + ((1,) * (ref.dim() - dim - 1))
-    return src.view(size).expand_as(ref)
+    return src.reshape(size).expand_as(ref)
 
 
 def scatter_reduce(
