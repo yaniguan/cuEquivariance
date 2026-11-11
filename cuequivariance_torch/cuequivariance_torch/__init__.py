@@ -23,34 +23,50 @@ __version__ = (
     importlib.resources.files(__package__).joinpath("VERSION").read_text().strip()
 )
 
-from .primitives.transpose import TransposeSegments, TransposeIrrepsLayout
-from .primitives.segmented_polynomial import SegmentedPolynomial
-from .primitives.deprecated import (
-    TensorProduct,
-    EquivariantTensorProduct,
-    SymmetricTensorProduct,
-    IWeightedSymmetricTensorProduct,
+from cuequivariance_torch import graph_locality, layers, profiling
+
+from .graph_locality import (
+    GraphLocalityPermutation,
+    estimate_edge_bandwidth_metrics,
+    morton_code_3d,
+    reorder_graph_for_locality,
+    restore_edge_order,
+    restore_node_order,
 )
-from .operations.tp_channel_wise import ChannelWiseTensorProduct
-from .operations.tp_fully_connected import FullyConnectedTensorProduct
 from .operations.linear import Linear
-from .operations.symmetric_contraction import SymmetricContraction
 from .operations.rotation import (
+    Inversion,
     Rotation,
     encode_rotation_angle,
     vector_to_euler_angles,
-    Inversion,
 )
 from .operations.spherical_harmonics import SphericalHarmonics
+from .operations.symmetric_contraction import SymmetricContraction
+from .operations.tp_channel_wise import ChannelWiseTensorProduct
+from .operations.tp_fully_connected import FullyConnectedTensorProduct
+from .primitives.deprecated import (
+    EquivariantTensorProduct,
+    IWeightedSymmetricTensorProduct,
+    SymmetricTensorProduct,
+    TensorProduct,
+)
+from .primitives.segmented_polynomial import SegmentedPolynomial
+from .primitives.transpose import TransposeIrrepsLayout, TransposeSegments
 from .primitives.triangle import (
+    TriMulPrecision,
+    attention_pair_bias,
     mask_to_kv_lengths,
     triangle_attention,
     triangle_multiplicative_update,
-    attention_pair_bias,
-    TriMulPrecision,
 )
-
-from cuequivariance_torch import layers
+from .profiling import (
+    GPU_SPECS,
+    BenchmarkRooflineResult,
+    GPUSpec,
+    RooflineReport,
+    analyze_roofline,
+    benchmark_roofline,
+)
 
 
 def onnx_custom_translation_table():
@@ -104,6 +120,20 @@ __all__ = [
     "attention_pair_bias",
     "TriMulPrecision",
     "layers",
+    "profiling",
+    "graph_locality",
+    "GPUSpec",
+    "GPU_SPECS",
+    "RooflineReport",
+    "BenchmarkRooflineResult",
+    "analyze_roofline",
+    "benchmark_roofline",
+    "GraphLocalityPermutation",
+    "morton_code_3d",
+    "reorder_graph_for_locality",
+    "restore_node_order",
+    "restore_edge_order",
+    "estimate_edge_bandwidth_metrics",
     "onnx_custom_translation_table",
     "register_tensorrt_plugins",
 ]
