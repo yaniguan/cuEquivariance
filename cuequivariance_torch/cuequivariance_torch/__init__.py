@@ -42,6 +42,7 @@ from .operations.rotation import (
     Inversion,
 )
 from .operations.spherical_harmonics import SphericalHarmonics
+from .operations.cartesian_tensor import CartesianToIrreps, IrrepsToCartesian
 from .primitives.triangle import (
     mask_to_kv_lengths,
     triangle_attention,
@@ -98,6 +99,8 @@ __all__ = [
     "vector_to_euler_angles",
     "Inversion",
     "SphericalHarmonics",
+    "CartesianToIrreps",
+    "IrrepsToCartesian",
     "mask_to_kv_lengths",
     "triangle_attention",
     "triangle_multiplicative_update",
