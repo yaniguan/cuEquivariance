@@ -284,7 +284,7 @@ class SegmentedPolynomial(nn.Module):
         elif method == "indexed_linear":
             try:
                 self.m = SegmentedPolynomialIndexedLinear(
-                    polynomial, math_dtype, output_dtype_map, name
+                    polynomial, math_dtype, output_dtype_map, name, self.options
                 )
             except ImportError:
                 method = "naive"
@@ -349,18 +349,26 @@ class SegmentedPolynomial(nn.Module):
                 and not is_fx_tracing
                 and len(inputs) > 0
                 and inputs[0].device == torch.device("cpu")
-                and self.method == "fused_tp"
+                and self.method in ("fused_tp", "indexed_linear")
             ):
+                method_label = (
+                    "Fused TP" if self.method == "fused_tp" else "indexed_linear"
+                )
                 warnings.warn(
-                    "Fused TP is not supported on CPU. Falling back to naive implementation."
+                    f"{method_label} is not supported on CPU. Falling back to naive implementation."
                 )
                 if not hasattr(self, "_cpu_fallback"):
+                    fallback_math_dtype = (
+                        None
+                        if self.method == "indexed_linear"
+                        else self._math_dtype_orig
+                    )
                     object.__setattr__(
                         self,
                         "_cpu_fallback",
                         SegmentedPolynomialNaive(
                             self._polynomial_orig,
-                            self._math_dtype_orig,
+                            fallback_math_dtype,
                             self._output_dtype_map_orig,
                         ),
                     )
@@ -402,7 +410,8 @@ class SegmentedPolynomial(nn.Module):
                 neighbor lists) are safely treated as masked-out invalid entries.
 
                 .. note::
-                   Method ``"indexed_linear"`` requires the indices to be sorted.
+                   Method ``"indexed_linear"`` requires the indices to be sorted
+                   unless ``options={"sort_indices": True}`` is specified.
 
             output_shapes: A dictionary specifying the size of the output batch
                 dimensions using Tensors. We only read ``shape_tensor.shape[:-1]``
