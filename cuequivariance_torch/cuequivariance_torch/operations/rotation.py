@@ -16,15 +16,15 @@ import math
 import warnings
 from typing import Dict, List, Optional
 
+import cuequivariance as cue
 import torch
+from cuequivariance import descriptors
 from cuequivariance.group_theory.irreps_array.misc_ui import (
     default_irreps,
     default_layout,
 )
 
-import cuequivariance as cue
 import cuequivariance_torch as cuet
-from cuequivariance import descriptors
 
 
 def _select_rotation_method(
@@ -85,6 +85,7 @@ def _execute_rotation_polynomial(
     indices_in: Optional[torch.Tensor],
     indices_out: Optional[torch.Tensor],
     size_out: Optional[int],
+    mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if x.ndim == 0 or x.shape[-1] != out_dim:
         raise ValueError(
@@ -180,6 +181,7 @@ def _execute_rotation_polynomial(
             input_indices=input_indices,
             output_shapes=output_shapes,
             output_indices=output_indices,
+            mask=mask,
         )
         # Transpose layout on node tensor AFTER indexed scatter inside f
         return transpose_out(output[0])
@@ -187,6 +189,7 @@ def _execute_rotation_polynomial(
     # Unindexed execution: fast path for standard non-empty 2D tensors
     if (
         size_out is None
+        and mask is None
         and x.ndim == 2
         and all(e.ndim == 2 for e in encodings)
         and (
@@ -198,7 +201,7 @@ def _execute_rotation_polynomial(
         output = f([*encodings, transpose_in(x)])
         return transpose_out(output[0])
 
-    # General arbitrary-leading-batch path: (*batch, dim)
+    # General arbitrary-leading-batch / masked path: (*batch, dim)
     out_batch = torch.broadcast_shapes(*(e.shape[:-1] for e in encodings), x.shape[:-1])
     n_flat = math.prod(out_batch)
     if n_flat == 0:
@@ -215,13 +218,20 @@ def _execute_rotation_polynomial(
 
     encodings_flat = [_flatten_for_batch(e, out_batch, n_flat) for e in encodings]
     x_flat = _flatten_for_batch(x, out_batch, n_flat)
+    mask_flat = (
+        mask.to(torch.bool).expand(out_batch).reshape(n_flat)
+        if mask is not None
+        else None
+    )
     output_shapes_unindexed: Optional[Dict[int, torch.Tensor]] = (
         {0: torch.empty((size_out, 1), device=x.device)}
         if size_out is not None
         else None
     )
     output = f(
-        [*encodings_flat, transpose_in(x_flat)], output_shapes=output_shapes_unindexed
+        [*encodings_flat, transpose_in(x_flat)],
+        output_shapes=output_shapes_unindexed,
+        mask=mask_flat,
     )
     y = transpose_out(output[0])
     if size_out is not None:
@@ -326,6 +336,7 @@ class Rotation(torch.nn.Module):
         indices_in: Optional[torch.Tensor] = None,
         indices_out: Optional[torch.Tensor] = None,
         size_out: Optional[int] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass of the rotation layer.
@@ -338,6 +349,7 @@ class Rotation(torch.nn.Module):
             indices_in (torch.Tensor, optional): 1D integer index tensor to gather rows from ``x`` after input layout transposition.
             indices_out (torch.Tensor, optional): 1D integer index tensor to scatter-add rotated rows before output layout transposition.
             size_out (int, optional): Output batch size, required when ``indices_out`` is provided.
+            mask (torch.Tensor, optional): Optional boolean/float mask for fixed-capacity execution.
 
         Returns:
             torch.Tensor: The rotated tensor.
@@ -360,6 +372,7 @@ class Rotation(torch.nn.Module):
             indices_in,
             indices_out,
             size_out,
+            mask=mask,
         )
 
 
@@ -417,6 +430,7 @@ class EdgeRotation(torch.nn.Module):
         math_dtype: Optional[str | torch.dtype] = None,
         use_fallback: Optional[bool] = None,
         method: Optional[str] = None,
+        auto_uniform_segments: bool = True,
     ):
         super().__init__()
         (irreps,) = default_irreps(irreps)
@@ -435,7 +449,20 @@ class EdgeRotation(torch.nn.Module):
             if self.inverse
             else descriptors.xy_rotation(irreps)
         )
-        same_shape = e.all_same_segment_shape()
+        if auto_uniform_segments:
+            e = e.uniformize_segments()
+        same_shape = (
+            e.all_same_segment_shape()
+            and all(o.ndim in (0, 1) for o in e.polynomial.operands)
+            and len(
+                {
+                    o.segment_shape
+                    for o in e.polynomial.operands
+                    if o.ndim == 1 and len(o.segments) > 0
+                }
+            )
+            <= 1
+        )
 
         layout_in = default_layout(layout_in or layout)
         self.transpose_in = cuet.TransposeIrrepsLayout(
@@ -478,6 +505,7 @@ class EdgeRotation(torch.nn.Module):
         indices_in: Optional[torch.Tensor] = None,
         indices_out: Optional[torch.Tensor] = None,
         size_out: Optional[int] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply the 2-angle edge rotation.
 
@@ -578,6 +606,7 @@ class EdgeRotation(torch.nn.Module):
             indices_in,
             indices_out,
             size_out,
+            mask=mask,
         )
 
 
