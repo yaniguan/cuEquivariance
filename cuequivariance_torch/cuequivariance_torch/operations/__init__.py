@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .cartesian_tensor import CartesianToIrreps, IrrepsToCartesian
+from .gate import Gate
 from .linear import Linear
 from .rotation import (
     EdgeRotation,
@@ -29,6 +30,7 @@ from .tp_channel_wise import ChannelWiseTensorProduct
 from .tp_fully_connected import FullyConnectedTensorProduct
 
 __all__ = [
+    "Gate",
     "ChannelWiseTensorProduct",
     "FullyConnectedTensorProduct",
     "Linear",

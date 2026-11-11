@@ -46,6 +46,8 @@ from .operations.rotation import (
 )
 from .operations.spherical_harmonics import SphericalHarmonics
 from .operations.cartesian_tensor import CartesianToIrreps, IrrepsToCartesian
+from .operations.gate import Gate
+from .layers.equivariant_norm import EquivariantRMSNorm, EquivariantLayerNorm
 from .primitives.triangle import (
     mask_to_kv_lengths,
     triangle_attention,
@@ -107,6 +109,9 @@ __all__ = [
     "SphericalHarmonics",
     "CartesianToIrreps",
     "IrrepsToCartesian",
+    "Gate",
+    "EquivariantRMSNorm",
+    "EquivariantLayerNorm",
     "mask_to_kv_lengths",
     "triangle_attention",
     "triangle_multiplicative_update",
