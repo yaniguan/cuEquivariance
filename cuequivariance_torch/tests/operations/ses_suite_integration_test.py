@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import warnings
 
-import cuequivariance as cue
-import cuequivariance_torch as cuet
 import numpy as np
 import scipy.spatial.transform
 import torch
 from cuequivariance.group_theory.experimental import escn
+
+import cuequivariance as cue
+import cuequivariance_torch as cuet
 
 
 class _MiniPolarizableESCN(torch.nn.Module):

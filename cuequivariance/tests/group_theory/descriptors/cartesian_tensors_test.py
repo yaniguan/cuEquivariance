@@ -15,7 +15,6 @@
 import functools
 import itertools
 
-import cuequivariance as cue
 import numpy as np
 import pytest
 from cuequivariance.group_theory.descriptors import (
@@ -28,6 +27,8 @@ from cuequivariance.group_theory.descriptors import (
     symmetric_cartesian_formula,
     symmetric_traceless_multipole_to_irreps,
 )
+
+import cuequivariance as cue
 
 
 def _symmetrize_tensor(T: np.ndarray) -> np.ndarray:

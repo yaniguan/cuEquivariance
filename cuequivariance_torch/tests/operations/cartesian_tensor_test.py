@@ -15,12 +15,13 @@
 import copy
 import itertools
 
-import cuequivariance as cue
-import cuequivariance_torch as cuet
 import numpy as np
 import pytest
 import torch
 from cuequivariance_torch.operations import CartesianToIrreps, IrrepsToCartesian
+
+import cuequivariance as cue
+import cuequivariance_torch as cuet
 
 device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 

@@ -17,13 +17,13 @@ from __future__ import annotations
 import math
 from typing import Optional, Sequence
 
-import cuequivariance as cue
 import torch
 import torch.nn as nn
-from cuequivariance import descriptors
 from cuequivariance.group_theory.irreps_array.misc_ui import default_layout
 
+import cuequivariance as cue
 import cuequivariance_torch as cuet
+from cuequivariance import descriptors
 
 
 def _resolve_torch_layout(
