@@ -37,7 +37,10 @@ from .operations.linear import Linear
 from .operations.symmetric_contraction import SymmetricContraction
 from .operations.rotation import (
     Rotation,
+    EdgeRotation,
     encode_rotation_angle,
+    encode_rotation_trig,
+    encode_edge_rotations,
     vector_to_euler_angles,
     Inversion,
 )
@@ -51,7 +54,7 @@ from .primitives.triangle import (
     TriMulPrecision,
 )
 
-from cuequivariance_torch import layers
+from cuequivariance_torch import layers, operations
 
 
 def onnx_custom_translation_table():
@@ -95,7 +98,10 @@ __all__ = [
     "Linear",
     "SymmetricContraction",
     "Rotation",
+    "EdgeRotation",
     "encode_rotation_angle",
+    "encode_rotation_trig",
+    "encode_edge_rotations",
     "vector_to_euler_angles",
     "Inversion",
     "SphericalHarmonics",
@@ -107,6 +113,7 @@ __all__ = [
     "attention_pair_bias",
     "TriMulPrecision",
     "layers",
+    "operations",
     "onnx_custom_translation_table",
     "register_tensorrt_plugins",
 ]

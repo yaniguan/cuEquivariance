@@ -15,9 +15,12 @@
 from .cartesian_tensor import CartesianToIrreps, IrrepsToCartesian
 from .linear import Linear
 from .rotation import (
+    EdgeRotation,
     Inversion,
     Rotation,
+    encode_edge_rotations,
     encode_rotation_angle,
+    encode_rotation_trig,
     vector_to_euler_angles,
 )
 from .spherical_harmonics import SphericalHarmonics
@@ -31,7 +34,10 @@ __all__ = [
     "Linear",
     "SymmetricContraction",
     "Rotation",
+    "EdgeRotation",
     "encode_rotation_angle",
+    "encode_rotation_trig",
+    "encode_edge_rotations",
     "vector_to_euler_angles",
     "Inversion",
     "SphericalHarmonics",
