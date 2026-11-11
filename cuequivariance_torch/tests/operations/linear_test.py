@@ -577,6 +577,9 @@ def test_linear_indexed_auto_sort_indices(
         lin_idx.f.m,
         cuet.primitives.segmented_polynomial_indexed_linear.SegmentedPolynomialIndexedLinear,
     )
+    if not use_real_cuda:
+        lin_idx.f.options["disable_cpu_fallback"] = True
+        lin_idx_no_sort.f.options["disable_cpu_fallback"] = True
 
     # Unsorted species indices (note class 1 is absent, classes 0/2/3/4 repeated out of order)
     raw_indices = [4, 0, 2, 4, 3, 0, 2, 0, 4, 3, 2]

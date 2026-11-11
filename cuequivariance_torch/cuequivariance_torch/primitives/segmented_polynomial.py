@@ -347,6 +347,7 @@ class SegmentedPolynomial(nn.Module):
                 not torch.jit.is_tracing()
                 and not torch.compiler.is_compiling()
                 and not is_fx_tracing
+                and not self.options.get("disable_cpu_fallback", False)
                 and len(inputs) > 0
                 and inputs[0].device == torch.device("cpu")
                 and self.method in ("fused_tp", "indexed_linear")

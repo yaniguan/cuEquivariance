@@ -90,6 +90,9 @@ class FullyConnectedTensorProduct(torch.nn.Module):
         self.irreps_in1 = irreps_in1
         self.irreps_in2 = irreps_in2
         self.irreps_out = irreps_out
+        self.in1_dim: int = irreps_in1.dim
+        self.in2_dim: int = irreps_in2.dim
+        self.out_dim: int = irreps_out.dim
 
         self.weight_numel = e.polynomial.operations[0][1].operands[0].size
 
@@ -261,13 +264,13 @@ class FullyConnectedTensorProduct(torch.nn.Module):
                 raise ValueError(
                     f"Expected weight last dim {self.weight_numel}, got {weight_tensor.shape[-1]}"
                 )
-            if x1.shape[-1] != self.irreps_in1.dim:
+            if x1.shape[-1] != self.in1_dim:
                 raise ValueError(
-                    f"Expected x1 last dim {self.irreps_in1.dim}, got {x1.shape[-1]}"
+                    f"Expected x1 last dim {self.in1_dim}, got {x1.shape[-1]}"
                 )
-            if x2.shape[-1] != self.irreps_in2.dim:
+            if x2.shape[-1] != self.in2_dim:
                 raise ValueError(
-                    f"Expected x2 last dim {self.irreps_in2.dim}, got {x2.shape[-1]}"
+                    f"Expected x2 last dim {self.in2_dim}, got {x2.shape[-1]}"
                 )
             zero_anchor = (
                 (weight_tensor * weight_tensor).sum()
@@ -276,7 +279,7 @@ class FullyConnectedTensorProduct(torch.nn.Module):
             ) * 0.0
             return (
                 torch.zeros(
-                    (size_out, self.irreps_out.dim),
+                    (size_out, self.out_dim),
                     dtype=weight_tensor.dtype,
                     device=x1.device,
                 )
