@@ -103,6 +103,13 @@ class SegmentedPolynomialFromUniform1dJit(nn.Module):
             )
 
         if not torch.jit.is_scripting():
+            if options is not None and options.get("auto_uniform_segments", False):
+                min_extent = options.get("uniform_min_extent", 16)
+                max_path_factor = options.get("uniform_max_path_factor", 8.0)
+                polynomial = polynomial.uniformize_segments(
+                    min_extent=min_extent,
+                    max_path_factor=max_path_factor,
+                )
             try:
                 polynomial = polynomial.flatten_coefficient_modes()
             except ValueError as e:

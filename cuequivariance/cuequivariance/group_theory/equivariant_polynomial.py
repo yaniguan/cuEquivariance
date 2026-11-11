@@ -391,6 +391,34 @@ class EquivariantPolynomial:
             self.inputs, self.outputs, self.polynomial.flatten_coefficient_modes()
         )
 
+    def uniformize_segments(
+        self,
+        *,
+        min_extent: int = 16,
+        max_path_factor: float = 8.0,
+    ) -> EquivariantPolynomial:
+        """Uniformize 1D segment extents across all operands by factoring out their GCD via :meth:`split_mode`.
+
+        Args:
+            min_extent (int, optional): Minimum allowed GCD segment extent when splitting
+                non-uniform segments. Must be >= 1. Defaults to 16.
+            max_path_factor (float, optional): Maximum allowed ratio of total paths after
+                mode splitting relative to total paths after flattening coefficient modes.
+                Must be >= 1.0. Defaults to 8.0.
+
+        Returns:
+            :class:`cue.EquivariantPolynomial <cuequivariance.EquivariantPolynomial>`:
+                A uniform-segment equivariant polynomial with identical representations and semantics,
+                or ``self`` unchanged if uniformization is inapplicable or rejected by the cost model.
+        """
+        poly = self.polynomial.uniformize_segments(
+            min_extent=min_extent,
+            max_path_factor=max_path_factor,
+        )
+        if poly is self.polynomial:
+            return self
+        return EquivariantPolynomial(self.inputs, self.outputs, poly)
+
     def symmetrize_for_identical_operands(self) -> EquivariantPolynomial:
         """Symmetrize the paths of the segmented tensor products for identical operands.
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import itertools
+import math
 from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
@@ -29,6 +30,23 @@ from cuequivariance.segmented_polynomials.segmented_tensor_product import (
 )
 
 from .dimensions_dict import format_dimensions_dict
+
+
+def _is_uniform_1d_ready(poly: SegmentedPolynomial) -> bool:
+    """Check whether ``poly`` satisfies all structural requirements of ``uniform_1d``."""
+    if not poly.all_same_segment_shape():
+        return False
+    extents: set[int] = set()
+    for o in poly.operands:
+        if o.ndim not in (0, 1):
+            return False
+        if any(len(s) != o.ndim for s in o.segments):
+            return False
+        if o.ndim == 1:
+            extents.add(o.segment_shape[0])
+    if len(extents) > 1:
+        return False
+    return all(stp.coefficient_subscripts == "" for _, stp in poly.operations)
 
 
 @dataclasses.dataclass(init=False, frozen=True)
@@ -735,6 +753,128 @@ class SegmentedPolynomial:
             self.outputs,
             [(ope, stp.flatten_coefficient_modes()) for ope, stp in self.operations],
         )
+
+    def uniformize_segments(
+        self,
+        *,
+        min_extent: int = 16,
+        max_path_factor: float = 8.0,
+    ) -> SegmentedPolynomial:
+        """Uniformize 1D segment extents across all operands by factoring out their GCD via :meth:`split_mode`.
+
+        This compiler pass prepares polynomials with non-uniform 1D segment extents (such as those
+        arising from tapered irrep multiplicities like ``"128x0e + 64x1o + 32x2e"``) for the
+        ``uniform_1d`` execution backend. It flattens coefficient modes, squeezes singleton modes,
+        and splits all 1D modes by the greatest common divisor (GCD) of all 1D segment extents.
+
+        Because splitting a 1D segment ``(k * g,)`` yields ``k`` contiguous slices of ``(g,)``,
+        the flat memory layout and total size of every operand are preserved without any transpose.
+        If the polynomial cannot be made ``uniform_1d``-compatible or violates the cost-model
+        guardrails, ``self`` is returned unchanged.
+
+        Args:
+            min_extent (int, optional): Minimum allowed GCD segment extent when splitting
+                non-uniform segments. Must be >= 1. Defaults to 16.
+            max_path_factor (float, optional): Maximum allowed ratio of total paths after
+                mode splitting relative to total paths after flattening coefficient modes.
+                Must be >= 1.0. Defaults to 8.0.
+
+        Returns:
+            :class:`cue.SegmentedPolynomial <cuequivariance.SegmentedPolynomial>`:
+                A uniform-segment polynomial with identical flat operand sizes and semantics,
+                or ``self`` unchanged if uniformization is inapplicable or rejected by the cost model.
+        """
+        if min_extent < 1:
+            raise ValueError(f"min_extent must be >= 1, got {min_extent}")
+        if max_path_factor < 1.0:
+            raise ValueError(f"max_path_factor must be >= 1.0, got {max_path_factor}")
+
+        if _is_uniform_1d_ready(self):
+            return self
+
+        try:
+            p = self.flatten_coefficient_modes().squeeze_modes()
+        except (ValueError, AssertionError):
+            return self
+
+        for o in p.operands:
+            if o.num_segments == 0 or o.ndim not in (0, 1):
+                return self
+            if any(len(s) != o.ndim for s in o.segments):
+                return self
+
+        if any(stp.coefficient_subscripts != "" for _, stp in p.operations):
+            return self
+
+        orig_sizes = [o.size for o in self.operands]
+        if [o.size for o in p.operands] != orig_sizes:
+            return self
+
+        extents = {s[0] for o in p.operands if o.ndim == 1 for s in o.segments}
+        if len(extents) <= 1:
+            return p if _is_uniform_1d_ready(p) else self
+
+        g = math.gcd(*extents)
+        if g < min_extent:
+            return self
+
+        orig_paths = sum(stp.num_paths for _, stp in p.operations)
+        max_allowed_paths = max_path_factor * max(1, orig_paths)
+
+        projected_paths = 0
+        for _, stp in p.operations:
+            stp_modes = sorted({ss for ss in stp.subscripts.operands if len(ss) == 1})
+            for path in stp.paths:
+                factor = 1
+                for m in stp_modes:
+                    dim = stp.get_path_dim(path, m)
+                    if dim % g != 0:
+                        return self
+                    factor *= dim // g
+                projected_paths += factor
+                if projected_paths > max_allowed_paths:
+                    return self
+
+        new_ops = []
+        try:
+            for ope, stp in p.operations:
+                stp_modes = sorted(
+                    {ss for ss in stp.subscripts.operands if len(ss) == 1}
+                )
+                for mode in stp_modes:
+                    stp = stp.split_mode(mode, g)
+                new_ops.append((ope, stp))
+        except ValueError:
+            return self
+
+        new_inputs = [
+            cue.SegmentedOperand(ndim=1, segments=[(g,)] * (o.size // g))
+            if o.ndim == 1
+            else o
+            for o in p.inputs
+        ]
+        new_outputs = [
+            cue.SegmentedOperand(ndim=1, segments=[(g,)] * (o.size // g))
+            if o.ndim == 1
+            else o
+            for o in p.outputs
+        ]
+        p_split = SegmentedPolynomial._from_default_operands(
+            new_inputs, new_outputs, new_ops
+        )
+
+        split_paths = sum(stp.num_paths for _, stp in p_split.operations)
+        if split_paths > max_allowed_paths:
+            return self
+
+        if not _is_uniform_1d_ready(p_split):
+            return self
+        if any(o.segment_shape != (g,) for o in p_split.operands if o.ndim == 1):
+            return self
+        if [o.size for o in p_split.operands] != orig_sizes:
+            return self
+
+        return p_split
 
     def symmetrize_for_identical_operands(self) -> SegmentedPolynomial:
         """Symmetrize the paths of the segmented tensor products for identical operands.
