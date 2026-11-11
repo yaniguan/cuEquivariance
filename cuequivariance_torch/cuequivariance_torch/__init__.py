@@ -67,8 +67,24 @@ from .primitives.triangle import (
     attention_pair_bias,
     TriMulPrecision,
 )
+from .profiling import (
+    GPUSpec,
+    GPU_SPECS,
+    RooflineReport,
+    BenchmarkRooflineResult,
+    analyze_roofline,
+    benchmark_roofline,
+)
+from .graph_locality import (
+    GraphLocalityPermutation,
+    morton_code_3d,
+    reorder_graph_for_locality,
+    restore_node_order,
+    restore_edge_order,
+    estimate_edge_bandwidth_metrics,
+)
 
-from cuequivariance_torch import layers, operations
+from cuequivariance_torch import graph_locality, layers, operations, profiling
 
 
 def onnx_custom_translation_table():
@@ -139,6 +155,20 @@ __all__ = [
     "TriMulPrecision",
     "layers",
     "operations",
+    "profiling",
+    "graph_locality",
+    "GPUSpec",
+    "GPU_SPECS",
+    "RooflineReport",
+    "BenchmarkRooflineResult",
+    "analyze_roofline",
+    "benchmark_roofline",
+    "GraphLocalityPermutation",
+    "morton_code_3d",
+    "reorder_graph_for_locality",
+    "restore_node_order",
+    "restore_edge_order",
+    "estimate_edge_bandwidth_metrics",
     "onnx_custom_translation_table",
     "register_tensorrt_plugins",
 ]
