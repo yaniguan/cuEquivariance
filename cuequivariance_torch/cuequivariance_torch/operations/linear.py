@@ -148,6 +148,7 @@ class Linear(torch.nn.Module):
         x: torch.Tensor,
         weight: Optional[torch.Tensor] = None,
         weight_indices: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass of the linear layer.
@@ -161,6 +162,8 @@ class Linear(torch.nn.Module):
             weight_indices (torch.Tensor, optional): The indices of the weight tensor:
                if weight_classes > 1, this is an integer tensor of shape (batch_size,),
                indicating which weight slice to use for each batch element.
+            mask (torch.Tensor, optional): Optional boolean mask indicating valid elements
+               for fixed-capacity execution.
 
         Returns:
             torch.Tensor: The output tensor after applying the linear transformation.
@@ -187,5 +190,21 @@ class Linear(torch.nn.Module):
         if weight is None:
             raise ValueError("Weights should not be None")
 
-        output = self.f([weight, self.transpose_in(x)], input_indices=input_indices)
+        if (
+            x.ndim == 1
+            and len(input_indices) == 0
+            and self.shared_weights
+            and weight.ndim == 2
+            and weight.shape[0] == 1
+        ):
+            weight = weight.squeeze(0)
+
+        if mask is None:
+            output = self.f([weight, self.transpose_in(x)], input_indices=input_indices)
+        else:
+            output = self.f(
+                [weight, self.transpose_in(x)],
+                input_indices=input_indices,
+                mask=mask,
+            )
         return self.transpose_out(output[0])
