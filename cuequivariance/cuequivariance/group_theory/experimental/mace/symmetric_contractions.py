@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from functools import cache
 from typing import Optional
 
@@ -19,6 +20,9 @@ import numpy as np
 
 import cuequivariance as cue
 from cuequivariance.etc.linalg import round_to_sqrt_rational, triu_array
+from cuequivariance.group_theory.descriptors.symmetric_contractions import (
+    _mul_ir_to_ir_mul_perm,
+)
 from cuequivariance.group_theory.descriptors.symmetric_contractions import (
     _symmetric_contraction_core as _std_symmetric_contraction_core,
 )
@@ -88,12 +92,23 @@ def _symmetric_contraction_cached(
 ) -> tuple[cue.SegmentedPolynomial, np.ndarray]:
     assert min(degrees) > 0
 
+    all_muls = [*irreps_in.muls, *irreps_out.muls]
+    mul_gcd = math.gcd(*all_muls) if all_muls else 1
+    if mul_gcd == 0:
+        mul_gcd = 1
+
+    poly2 = _std_symmetric_contraction_core(irreps_in, irreps_out, tuple(degrees))
+    if len(irreps_out) == 0:
+        return poly2, np.zeros((0, poly2.inputs[0].num_segments), dtype=np.float64)
+
     # poly1 replicates the behavior of the original MACE implementation
     poly1 = cue.SegmentedPolynomial.stack(
         [
             cue.SegmentedPolynomial.stack(
                 [
-                    _symmetric_contraction_poly(irreps_in, irreps_out[i : i + 1], deg)
+                    _symmetric_contraction_poly(
+                        irreps_in, irreps_out[i : i + 1], deg, mul_gcd=mul_gcd
+                    )
                     for deg in reversed(degrees)
                 ],
                 [True, False, False],
@@ -102,7 +117,13 @@ def _symmetric_contraction_cached(
         ],
         [True, False, True],
     )
-    poly2 = _std_symmetric_contraction_core(irreps_in, irreps_out, tuple(degrees))
+    if len(poly1.operations) == 0:
+        assert all(d.num_paths == 0 for _, d in poly2.operations)
+        return poly2, np.zeros(
+            (poly1.inputs[0].num_segments, poly2.inputs[0].num_segments),
+            dtype=np.float64,
+        )
+
     a1, a2 = [
         np.concatenate(
             [
@@ -157,13 +178,18 @@ def _stp_to_matrix(
 
 # This function is an adaptation of https://github.com/ACEsuit/mace/blob/bd412319b11c5f56c37cec6c4cfae74b2a49ff43/mace/modules/symmetric_contraction.py
 def _symmetric_contraction_poly(
-    irreps_in: cue.Irreps, irreps_out: cue.Irreps, degree: int
+    irreps_in: cue.Irreps,
+    irreps_out: cue.Irreps,
+    degree: int,
+    mul_gcd: Optional[int] = None,
 ) -> cue.SegmentedPolynomial:
-    mul = irreps_in.muls[0]
-    assert all(mul == m for m in irreps_in.muls)
-    assert all(mul == m for m in irreps_out.muls)
-    irreps_in = irreps_in.set_mul(1)
-    irreps_out = irreps_out.set_mul(1)
+    if mul_gcd is None:
+        all_muls = [*irreps_in.muls, *irreps_out.muls]
+        mul_gcd = math.gcd(*all_muls) if all_muls else 1
+        if mul_gcd == 0:
+            mul_gcd = 1
+    base_in = irreps_in // mul_gcd
+    base_out = irreps_out // mul_gcd
 
     input_operands = range(1, degree + 1)
     output_operand = degree + 1
@@ -174,21 +200,34 @@ def _symmetric_contraction_poly(
     )
 
     for i in input_operands:
-        d.add_segment(i, (irreps_in.dim,))
+        d.add_segment(i, (base_in.dim,))
 
-    for _, ir in irreps_out:
-        u = U_matrix_real(irreps_in, ir, degree)
+    perm_in = _mul_ir_to_ir_mul_perm(base_in)
+    need_perm_in = perm_in != tuple(range(len(perm_in)))
+
+    for k_out, ir in base_out:
+        u = U_matrix_real(base_in, ir, degree)
         u = np.moveaxis(u, 0, -1)
-        # u is shape (irreps_in.dim, ..., irreps_in.dim, u, ir_out.dim)
+        # u is shape (base_in.dim, ..., base_in.dim, u, ir_out.dim)
+        if need_perm_in:
+            for ax in range(degree):
+                u = np.take(u, perm_in, axis=ax)
 
         if u.shape[-2] == 0:
-            d.add_segment(output_operand, {"i": ir.dim})
+            for _ in range(k_out):
+                d.add_segment(output_operand, {"i": ir.dim})
         else:
             u = triu_array(u, degree)
-            d.add_path(None, *(0,) * degree, None, c=u)
+            for _ in range(k_out):
+                d.add_path(None, *(0,) * degree, None, c=u)
 
     d = d.flatten_coefficient_modes()
-    d = d.append_modes_to_all_operands("u", {"u": mul})
+
+    perm_out = _mul_ir_to_ir_mul_perm(base_out)
+    if perm_out != tuple(range(len(perm_out))):
+        d = d.permute_segments(output_operand, perm_out)
+
+    d = d.append_modes_to_all_operands("u", {"u": mul_gcd})
 
     assert d.num_operands >= 3
     [w, x], y = d.operands[:2], d.operands[-1]

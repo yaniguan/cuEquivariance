@@ -12,9 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from functools import cache
 
 import cuequivariance as cue
+
+
+def _mul_ir_to_ir_mul_perm(irreps: cue.Irreps) -> tuple[int, ...]:
+    perm = []
+    offset = 0
+    for mul, ir in irreps:
+        for comp in range(ir.dim):
+            for c in range(mul):
+                perm.append(offset + c * ir.dim + comp)
+        offset += mul * ir.dim
+    return tuple(perm)
 
 
 @cache
@@ -34,24 +46,26 @@ def _symmetric_contraction_core(
     [degree] = degrees
     del degrees
 
-    mul = irreps_in.muls[0]
-    assert all(mul == m for m in irreps_in.muls)
-    assert all(mul == m for m in irreps_out.muls)
-    irreps_in = irreps_in.set_mul(1)
-    irreps_out = irreps_out.set_mul(1)
+    all_muls = [*irreps_in.muls, *irreps_out.muls]
+    mul_gcd = math.gcd(*all_muls) if all_muls else 1
+    if mul_gcd == 0:
+        mul_gcd = 1
+    base_in = irreps_in // mul_gcd
+    base_out = irreps_out // mul_gcd
 
     input_operands = range(1, degree + 1)
     output_operand = degree + 1
 
-    input_operand = cue.SegmentedOperand(ndim=1, segments=[(mul,)] * irreps_in.dim)
+    input_operand = cue.SegmentedOperand(ndim=1, segments=[(mul_gcd,)] * base_in.dim)
 
     if degree == 0:
         d = cue.SegmentedTensorProduct.from_subscripts("i_i")
-        for _, ir in irreps_out:
-            if not ir.is_scalar():
-                d.add_segment(output_operand, {"i": ir.dim})
-            else:
-                d.add_path(None, None, c=1, dims={"i": ir.dim})
+        for k_out, ir in base_out:
+            for _ in range(k_out):
+                if not ir.is_scalar():
+                    d.add_segment(output_operand, {"i": ir.dim})
+                else:
+                    d.add_path(None, None, c=1, dims={"i": ir.dim})
         d = d.flatten_modes("i")
 
     else:
@@ -61,23 +75,28 @@ def _symmetric_contraction_core(
         )
 
         for i in input_operands:
-            d.add_segment(i, (irreps_in.dim,))
+            d.add_segment(i, (base_in.dim,))
 
         U = cue.reduced_symmetric_tensor_product_basis(
-            irreps_in, degree, keep_ir=irreps_out, layout=cue.ir_mul
+            base_in, degree, keep_ir=base_out, layout=cue.ir_mul
         )
-        for _, ir in irreps_out:
+        for k_out, ir in base_out:
             u = U.filter(keep=ir)
-            if len(u.segments) == 0:
-                d.add_segment(output_operand, {"i": ir.dim})
-            else:
-                [u] = u.segments  # (a, b, c, ..., i, w)
-                d.add_path(None, *(0,) * degree, None, c=u)
+            for _ in range(k_out):
+                if len(u.segments) == 0:
+                    d.add_segment(output_operand, {"i": ir.dim})
+                else:
+                    [u_seg] = u.segments  # (a, b, c, ..., i, w)
+                    d.add_path(None, *(0,) * degree, None, c=u_seg)
 
         d = d.normalize_paths_for_operand(output_operand)
         d = d.flatten_coefficient_modes()
 
-    d = d.append_modes_to_all_operands("u", {"u": mul})
+    perm_out = _mul_ir_to_ir_mul_perm(base_out)
+    if perm_out != tuple(range(len(perm_out))):
+        d = d.permute_segments(output_operand, perm_out)
+
+    d = d.append_modes_to_all_operands("u", {"u": mul_gcd})
     for i in input_operands:
         assert d.operands[i] == input_operand
 
