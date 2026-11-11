@@ -40,6 +40,16 @@ from .spherical_harmonics_ import (
     spherical_harmonics,
     spherical_harmonics_ir_dict,
 )
+from .cartesian_tensors import (
+    CartesianTensorRep,
+    symmetric_cartesian_formula,
+    cartesian_to_irreps,
+    irreps_to_cartesian,
+    symmetric_traceless_multipole_to_irreps,
+    irreps_to_symmetric_traceless_multipole,
+    cartesian_to_irreps_ir_dict,
+    irreps_to_cartesian_ir_dict,
+)
 
 __all__ = [
     "transpose",
@@ -65,4 +75,12 @@ __all__ = [
     "sympy_spherical_harmonics",
     "spherical_harmonics",
     "spherical_harmonics_ir_dict",
+    "CartesianTensorRep",
+    "symmetric_cartesian_formula",
+    "cartesian_to_irreps",
+    "irreps_to_cartesian",
+    "symmetric_traceless_multipole_to_irreps",
+    "irreps_to_symmetric_traceless_multipole",
+    "cartesian_to_irreps_ir_dict",
+    "irreps_to_cartesian_ir_dict",
 ]
