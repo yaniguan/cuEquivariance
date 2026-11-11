@@ -50,6 +50,8 @@ class ChannelWiseTensorProduct(torch.nn.Module):
         use_fallback (bool, optional, deprecated): Whether to use a "fallback" implementation, now maps to method:
             If `True` the "naive" method is used.
             If `False` the "uniform_1d" method is used (make sure all segments have the same shape).
+        auto_uniform_segments (bool, optional): Whether to automatically split non-uniform 1D segments by their
+            greatest common divisor when cost-effective so the ``"uniform_1d"`` method can be used. Default is True.
 
     Note:
         In e3nn there was a irrep_normalization and path_normalization parameters.
@@ -73,6 +75,7 @@ class ChannelWiseTensorProduct(torch.nn.Module):
         math_dtype: Optional[str | torch.dtype] = None,
         use_fallback: Optional[bool] = None,
         method: Optional[str] = None,
+        auto_uniform_segments: bool = True,
     ):
         super().__init__()
         irreps_in1, irreps_in2 = default_irreps(irreps_in1, irreps_in2)
@@ -86,10 +89,20 @@ class ChannelWiseTensorProduct(torch.nn.Module):
             e.operands[-1].irreps,
         )
         assert descriptor.subscripts == "uv,iu,jv,kuv+ijk"
+        if auto_uniform_segments:
+            e = e.uniformize_segments()
         e2 = e.flatten_coefficient_modes().squeeze_modes()
         u1d_compatible = (
             e2.all_same_segment_shape()
-            and len(e2.polynomial.operations[0][1].subscripts.modes()) == 1
+            and len(e2.polynomial.operations[0][1].subscripts.modes()) <= 1
+            and len(
+                {
+                    o.segment_shape
+                    for o in e2.polynomial.operands
+                    if o.ndim == 1 and len(o.segments) > 0
+                }
+            )
+            <= 1
         )
 
         self.irreps_in1 = irreps_in1
