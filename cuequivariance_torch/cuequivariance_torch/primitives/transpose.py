@@ -180,4 +180,11 @@ class _transpose(torch.nn.Module):
         self.register_buffer("_info", info, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0:
+            return x.clone()
+        if x.ndim != 2:
+            orig_shape = x.shape
+            return segmented_transpose(
+                x.reshape(-1, orig_shape[-1]), self._info, True
+            ).reshape(orig_shape)
         return segmented_transpose(x, self._info, True)
