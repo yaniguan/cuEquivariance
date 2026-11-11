@@ -43,6 +43,8 @@ class Rotation(torch.nn.Module):
         use_fallback (bool, optional, deprecated): Whether to use a "fallback" implementation, now maps to method:
             If `True` the "naive" method is used.
             If `False` the "uniform_1d" method is used (make sure all segments have the same shape).
+        auto_uniform_segments (bool, optional): Whether to automatically split non-uniform 1D segments by their
+            greatest common divisor when cost-effective so the ``"uniform_1d"`` method can be used. Default is True.
     """
 
     def __init__(
@@ -56,6 +58,7 @@ class Rotation(torch.nn.Module):
         math_dtype: Optional[str | torch.dtype] = None,
         use_fallback: Optional[bool] = None,
         method: Optional[str] = None,
+        auto_uniform_segments: bool = True,
     ):
         super().__init__()
         (irreps,) = default_irreps(irreps)
@@ -66,7 +69,20 @@ class Rotation(torch.nn.Module):
             )
 
         e = descriptors.yxy_rotation(irreps)
-        same_shape = e.all_same_segment_shape()
+        if auto_uniform_segments:
+            e = e.uniformize_segments()
+        same_shape = (
+            e.all_same_segment_shape()
+            and all(o.ndim in (0, 1) for o in e.polynomial.operands)
+            and len(
+                {
+                    o.segment_shape
+                    for o in e.polynomial.operands
+                    if o.ndim == 1 and len(o.segments) > 0
+                }
+            )
+            <= 1
+        )
 
         self.irreps = irreps
         self.lmax = max(ir.l for _, ir in irreps)
@@ -225,6 +241,8 @@ class Inversion(torch.nn.Module):
         use_fallback (bool, optional, deprecated): Whether to use a "fallback" implementation, now maps to method:
             If `True` the "naive" method is used.
             If `False` the "uniform_1d" method is used (make sure all segments have the same shape).
+        auto_uniform_segments (bool, optional): Whether to automatically split non-uniform 1D segments by their
+            greatest common divisor when cost-effective so the ``"uniform_1d"`` method can be used. Default is True.
     """
 
     def __init__(
@@ -238,6 +256,7 @@ class Inversion(torch.nn.Module):
         math_dtype: Optional[torch.dtype] = None,
         use_fallback: Optional[bool] = None,
         method: Optional[str] = None,
+        auto_uniform_segments: bool = True,
     ):
         super().__init__()
         (irreps,) = default_irreps(irreps)
@@ -248,7 +267,20 @@ class Inversion(torch.nn.Module):
             )
 
         e = descriptors.inversion(irreps)
-        same_shape = e.all_same_segment_shape()
+        if auto_uniform_segments:
+            e = e.uniformize_segments()
+        same_shape = (
+            e.all_same_segment_shape()
+            and all(o.ndim in (0, 1) for o in e.polynomial.operands)
+            and len(
+                {
+                    o.segment_shape
+                    for o in e.polynomial.operands
+                    if o.ndim == 1 and len(o.segments) > 0
+                }
+            )
+            <= 1
+        )
 
         layout_in = default_layout(layout_in or layout)
         self.transpose_in = cuet.TransposeIrrepsLayout(

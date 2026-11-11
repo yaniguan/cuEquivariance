@@ -53,6 +53,8 @@ class SymmetricContraction(torch.nn.Module):
         use_fallback (bool, optional, deprecated): Whether to use a "fallback" implementation, now maps to method:
             If `True` the "naive" method is used.
             If `False` the "uniform_1d" method is used (make sure all segments have the same shape).
+        auto_uniform_segments (bool, optional): Whether to automatically split non-uniform 1D segments by their
+            greatest common divisor when cost-effective so the ``"uniform_1d"`` method can be used. Default is True.
 
     Examples:
         >>> device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -119,6 +121,7 @@ class SymmetricContraction(torch.nn.Module):
         original_mace: bool = False,
         use_fallback: Optional[bool] = None,
         method: Optional[str] = None,
+        auto_uniform_segments: bool = True,
     ):
         super().__init__()
 
@@ -137,7 +140,20 @@ class SymmetricContraction(torch.nn.Module):
         self.etp, p = symmetric_contraction(
             irreps_in, irreps_out, range(1, contraction_degree + 1)
         )
-        same_shape = self.etp.all_same_segment_shape()
+        if auto_uniform_segments:
+            self.etp = self.etp.uniformize_segments()
+        same_shape = (
+            self.etp.all_same_segment_shape()
+            and all(o.ndim in (0, 1) for o in self.etp.polynomial.operands)
+            and len(
+                {
+                    o.segment_shape
+                    for o in self.etp.polynomial.operands
+                    if o.ndim == 1 and len(o.segments) > 0
+                }
+            )
+            <= 1
+        )
 
         if original_mace:
             self.register_buffer(
