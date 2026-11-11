@@ -72,6 +72,58 @@ def test_spherical_harmonics(ell: int):
     np.testing.assert_allclose(np.sum(yl**2), (2 * ell + 1) * np.sum(vec**2) ** ell)
 
 
+@pytest.mark.parametrize("ir_vec", [cue.SO3(1), cue.O3(1, -1), cue.O3(1, 1)])
+@pytest.mark.parametrize(
+    "layout_arg, expected_layout",
+    [
+        (cue.ir_mul, cue.ir_mul),
+        (cue.mul_ir, cue.mul_ir),
+        ("ir_mul", cue.ir_mul),
+        ("mul_ir", cue.mul_ir),
+    ],
+)
+@pytest.mark.parametrize("ls", [[0], [1], [0, 1, 2, 3], [2, 0, 3]])
+def test_spherical_harmonics_layout_and_equivariance(
+    ir_vec: cue.Irrep,
+    layout_arg,
+    expected_layout: cue.IrrepsLayout,
+    ls: list[int],
+):
+    poly = cue.descriptors.spherical_harmonics(ir_vec, ls, layout=layout_arg)
+    assert poly.inputs[0].layout == expected_layout
+    assert poly.outputs[0].layout == expected_layout
+
+    rng = np.random.default_rng(42)
+    vec = rng.standard_normal(3)
+    angles = rng.standard_normal(poly.inputs[0].lie_dim)
+
+    discrete_cases = (
+        [np.array([])]
+        if isinstance(ir_vec, cue.SO3)
+        else [np.array([0]), np.array([1])]
+    )
+    for discrete in discrete_cases:
+        D_in = poly.inputs[0].exp_map(angles, discrete)
+        D_out = poly.outputs[0].exp_map(angles, discrete)
+
+        [yl_rot_in] = poly(D_in @ vec)
+        [yl] = poly(vec)
+        yl_rot_out = D_out @ yl
+        np.testing.assert_allclose(yl_rot_in, yl_rot_out, rtol=1e-12, atol=1e-12)
+
+
+def test_spherical_harmonics_layout_context_and_invalid():
+    with cue.assume(cue.O3, cue.mul_ir):
+        poly = cue.descriptors.spherical_harmonics(
+            cue.O3(1, -1), [0, 1, 2], layout=None
+        )
+        assert poly.inputs[0].layout == cue.mul_ir
+        assert poly.outputs[0].layout == cue.mul_ir
+
+    with pytest.raises(ValueError, match="Invalid layout"):
+        cue.descriptors.spherical_harmonics(cue.SO3(1), [0, 1], layout="invalid")
+
+
 @pytest.mark.parametrize("ell", [0, 1, 2, 3, 4])
 def test_yxy_rotation(ell: int):
     alpha = 0.3
