@@ -12,9 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 try:
     from cuequivariance_ops_torch import TriMulPrecision
@@ -72,6 +74,129 @@ def mask_to_kv_lengths(mask: torch.Tensor) -> torch.Tensor:
     return lengths.detach().contiguous()
 
 
+def _get_ops_backend(op_name: str, is_cuda: bool, use_fallback: bool):
+    """Return the CUDA backend callable when available and requested, else None."""
+    if use_fallback:
+        return None
+    try:
+        import cuequivariance_ops_torch as ops
+
+        f = getattr(ops, op_name)
+    except Exception:
+        return None
+    if not is_cuda and getattr(ops, "__spec__", None) is not None:
+        return None
+    return f
+
+
+def _apply_norm(
+    x: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    eps: float,
+    norm_kind: str,
+) -> torch.Tensor:
+    dim = x.shape[-1]
+    if norm_kind == "layer_norm":
+        return F.layer_norm(x, (dim,), weight=weight, bias=bias, eps=eps)
+    if norm_kind == "rms_norm":
+        return F.rms_norm(x, (dim,), weight=weight, eps=eps)
+    raise ValueError(
+        f"Unsupported norm_kind: {norm_kind!r}. Expected 'layer_norm' or 'rms_norm'."
+    )
+
+
+def _triangle_attention_fallback(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bias: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
+    return_aux: bool = False,
+    *,
+    kv_lengths: Optional[torch.Tensor] = None,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if q.ndim not in (4, 5):
+        raise ValueError(
+            f"triangle_attention: expected 4D or 5D query tensor, got shape {tuple(q.shape)}"
+        )
+    squeeze_batch = q.ndim == 4
+    if squeeze_batch:
+        q = q.unsqueeze(0)
+    if k.ndim == 4:
+        k = k.unsqueeze(0)
+    if v.ndim == 4:
+        v = v.unsqueeze(0)
+    if bias.ndim == 4:
+        bias = bias.unsqueeze(0)
+    if mask is not None and mask.ndim == 4:
+        mask = mask.unsqueeze(0)
+    if kv_lengths is not None and kv_lengths.ndim == 4:
+        kv_lengths = kv_lengths.unsqueeze(0)
+
+    B, N, H, Q, D = q.shape
+    K = k.shape[-2]
+    scale_val = 1.0 / math.sqrt(D) if scale is None else float(scale)
+
+    if K == 0:
+        output = torch.zeros_like(q)
+        lse = torch.zeros((B, N, H, Q, 1), device=q.device, dtype=torch.float32)
+        max_val = torch.zeros((B, N, H, Q, 1), device=q.device, dtype=torch.float32)
+        if squeeze_batch:
+            output = output.squeeze(0)
+            lse = lse.squeeze(0)
+            max_val = max_val.squeeze(0)
+        return (output, lse, max_val) if return_aux else output
+
+    acc_dtype = (
+        torch.float64
+        if (q.dtype == torch.float64 or bias.dtype == torch.float64)
+        else torch.float32
+    )
+    q_acc = q.to(acc_dtype)
+    k_acc = k.to(acc_dtype)
+    v_acc = v.to(acc_dtype)
+    bias_acc = bias.to(acc_dtype)
+
+    scores = torch.matmul(q_acc * scale_val, k_acc.transpose(-2, -1)) + bias_acc
+
+    valid_mask: Optional[torch.Tensor] = None
+    if kv_lengths is not None:
+        lengths = kv_lengths.clamp(min=0, max=K)
+        k_idx = torch.arange(K, device=q.device).view(1, 1, 1, 1, K)
+        valid_mask = k_idx < lengths
+    elif mask is not None:
+        valid_mask = mask.to(dtype=torch.bool)
+
+    if valid_mask is not None:
+        masked_scores = torch.where(valid_mask, scores, torch.full_like(scores, -1e9))
+        any_valid = valid_mask.any(dim=-1, keepdim=True)
+        attn = torch.where(
+            any_valid,
+            torch.softmax(masked_scores, dim=-1),
+            torch.zeros_like(masked_scores),
+        )
+    else:
+        masked_scores = scores
+        attn = torch.softmax(masked_scores, dim=-1)
+
+    output = torch.matmul(attn, v_acc).to(q.dtype)
+
+    if return_aux:
+        max_val = masked_scores.amax(dim=-1, keepdim=True).to(torch.float32)
+        lse = torch.logsumexp(masked_scores, dim=-1, keepdim=True).to(torch.float32)
+        if squeeze_batch:
+            output = output.squeeze(0)
+            lse = lse.squeeze(0)
+            max_val = max_val.squeeze(0)
+        return output, lse, max_val
+
+    if squeeze_batch:
+        output = output.squeeze(0)
+    return output
+
+
 def triangle_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -82,6 +207,7 @@ def triangle_attention(
     return_aux: bool = False,
     *,
     kv_lengths: Optional[torch.Tensor] = None,
+    use_fallback: bool = False,
 ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""
     Triangle Attention
@@ -116,6 +242,8 @@ def triangle_attention(
             Blackwell cu13 builds, ``kv_lengths`` selects the sm100f length fast path.
             Each length must be in ``[0, K]``; values greater than ``K`` are clamped
             to ``K`` (the row then attends the full key sequence).
+        use_fallback (bool, optional): If True, force the pure-PyTorch reference
+            fallback even when CUDA kernels are available. Defaults to False.
 
     Note:
         - B: batch size
@@ -195,14 +323,192 @@ def triangle_attention(
             "the fallback path."
         )
 
-    try:
-        from cuequivariance_ops_torch import triangle_attention as f
-    except Exception:
-        raise ImportError(
-            "Error importing triangle_attention from cuequivariance_ops_torch."
-        )
-    else:
+    f = _get_ops_backend("triangle_attention", q.is_cuda, use_fallback)
+    if f is not None:
         return f(q, k, v, bias, mask, scale, return_aux, kv_lengths=kv_lengths)
+    return _triangle_attention_fallback(
+        q,
+        k,
+        v,
+        bias,
+        mask=mask,
+        scale=scale,
+        return_aux=return_aux,
+        kv_lengths=kv_lengths,
+    )
+
+
+def _triangle_multiplicative_update_fallback(
+    x: torch.Tensor,
+    direction: str = "outgoing",
+    mask: Optional[torch.Tensor] = None,
+    norm_in_weight: Optional[torch.Tensor] = None,
+    norm_in_bias: Optional[torch.Tensor] = None,
+    p_in_weight: Optional[torch.Tensor] = None,
+    p_in_bias: Optional[torch.Tensor] = None,
+    g_in_weight: Optional[torch.Tensor] = None,
+    g_in_bias: Optional[torch.Tensor] = None,
+    norm_out_weight: Optional[torch.Tensor] = None,
+    norm_out_bias: Optional[torch.Tensor] = None,
+    p_out_weight: Optional[torch.Tensor] = None,
+    p_out_bias: Optional[torch.Tensor] = None,
+    g_out_weight: Optional[torch.Tensor] = None,
+    g_out_bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+    precision: Optional[TriMulPrecision | str] = None,
+) -> torch.Tensor:
+    if x.ndim < 3 or x.shape[-3] != x.shape[-2]:
+        raise ValueError(
+            f"triangle_multiplicative_update: expected x of shape (..., N, N, C), got {tuple(x.shape)}"
+        )
+
+    orig_dtype = x.dtype
+    is_bf16_mode = (
+        isinstance(precision, str) and precision.lower() == "bfloat16"
+    ) or getattr(precision, "name", None) == "BFLOAT16"
+
+    if is_bf16_mode:
+        x = x.to(torch.bfloat16)
+        if mask is not None:
+            mask = mask.to(torch.bfloat16)
+        if norm_in_weight is not None:
+            norm_in_weight = norm_in_weight.to(torch.bfloat16)
+        if norm_in_bias is not None:
+            norm_in_bias = norm_in_bias.to(torch.bfloat16)
+        if p_in_weight is not None:
+            p_in_weight = p_in_weight.to(torch.bfloat16)
+        if p_in_bias is not None:
+            p_in_bias = p_in_bias.to(torch.bfloat16)
+        if g_in_weight is not None:
+            g_in_weight = g_in_weight.to(torch.bfloat16)
+        if g_in_bias is not None:
+            g_in_bias = g_in_bias.to(torch.bfloat16)
+        if norm_out_weight is not None:
+            norm_out_weight = norm_out_weight.to(torch.bfloat16)
+        if norm_out_bias is not None:
+            norm_out_bias = norm_out_bias.to(torch.bfloat16)
+        if p_out_weight is not None:
+            p_out_weight = p_out_weight.to(torch.bfloat16)
+        if p_out_bias is not None:
+            p_out_bias = p_out_bias.to(torch.bfloat16)
+        if g_out_weight is not None:
+            g_out_weight = g_out_weight.to(torch.bfloat16)
+        if g_out_bias is not None:
+            g_out_bias = g_out_bias.to(torch.bfloat16)
+
+    N = x.shape[-2]
+    C = x.shape[-1]
+    batch_dims = x.shape[:-3]
+
+    if mask is not None:
+        if mask.ndim < 2 or mask.shape[-2:] != (N, N):
+            raise ValueError(
+                f"triangle_multiplicative_update: expected mask of shape (..., {N}, {N}), "
+                f"got {tuple(mask.shape)}"
+            )
+        batch_dims = torch.broadcast_shapes(batch_dims, mask.shape[:-2])
+        x = x.expand(batch_dims + (N, N, C))
+        mask = mask.expand(batch_dims + (N, N))
+
+    if p_in_weight is not None:
+        if (
+            p_in_weight.ndim != 2
+            or p_in_weight.shape[0] % 2 != 0
+            or p_in_weight.shape[1] != C
+        ):
+            raise ValueError(
+                f"p_in_weight must have shape (2*D, {C}), got {tuple(p_in_weight.shape)}"
+            )
+        D = p_in_weight.shape[0] // 2
+    elif g_in_weight is not None:
+        if (
+            g_in_weight.ndim != 2
+            or g_in_weight.shape[0] % 2 != 0
+            or g_in_weight.shape[1] != C
+        ):
+            raise ValueError(
+                f"g_in_weight must have shape (2*D, {C}), got {tuple(g_in_weight.shape)}"
+            )
+        D = g_in_weight.shape[0] // 2
+    elif p_in_bias is not None:
+        D = p_in_bias.shape[0] // 2
+    elif g_in_bias is not None:
+        D = g_in_bias.shape[0] // 2
+    elif norm_out_weight is not None:
+        D = norm_out_weight.shape[0]
+    elif norm_out_bias is not None:
+        D = norm_out_bias.shape[0]
+    elif p_out_weight is not None:
+        D = p_out_weight.shape[1]
+    else:
+        D = C
+
+    if p_out_weight is not None:
+        C_out = p_out_weight.shape[0]
+    elif g_out_weight is not None:
+        C_out = g_out_weight.shape[0]
+    elif p_out_bias is not None:
+        C_out = p_out_bias.shape[0]
+    elif g_out_bias is not None:
+        C_out = g_out_bias.shape[0]
+    else:
+        C_out = C
+
+    x_in = F.layer_norm(x, (C,), weight=norm_in_weight, bias=norm_in_bias, eps=eps)
+
+    if p_in_weight is not None:
+        p_proj = F.linear(x_in, p_in_weight, p_in_bias)
+    else:
+        if D != C:
+            raise ValueError(f"p_in_weight is required when D ({D}) != C ({C})")
+        p_proj = torch.cat([x_in, x_in], dim=-1)
+        if p_in_bias is not None:
+            p_proj = p_proj + p_in_bias
+
+    if g_in_weight is not None:
+        g_proj = F.linear(x_in, g_in_weight, g_in_bias)
+    else:
+        if D != C:
+            raise ValueError(f"g_in_weight is required when D ({D}) != C ({C})")
+        g_proj = torch.cat([x_in, x_in], dim=-1)
+        if g_in_bias is not None:
+            g_proj = g_proj + g_in_bias
+
+    ab = torch.sigmoid(g_proj) * p_proj
+    if mask is not None:
+        ab = ab * mask.unsqueeze(-1).to(dtype=ab.dtype)
+
+    a, b = ab.chunk(2, dim=-1)
+
+    a_perm = a.movedim(-1, -3)
+    b_perm = b.movedim(-1, -3)
+    if direction == "outgoing":
+        tri = torch.matmul(a_perm, b_perm.transpose(-2, -1)).movedim(-3, -1)
+    else:
+        tri = torch.matmul(a_perm.transpose(-2, -1), b_perm).movedim(-3, -1)
+
+    x_out = F.layer_norm(tri, (D,), weight=norm_out_weight, bias=norm_out_bias, eps=eps)
+
+    if p_out_weight is not None:
+        out_proj = F.linear(x_out, p_out_weight, p_out_bias)
+    else:
+        if C_out != D:
+            raise ValueError(
+                f"p_out_weight is required when C_out ({C_out}) != D ({D})"
+            )
+        out_proj = x_out + p_out_bias if p_out_bias is not None else x_out
+
+    if g_out_weight is not None:
+        out_gate_proj = F.linear(x_in, g_out_weight, g_out_bias)
+    else:
+        if C_out != C:
+            raise ValueError(
+                f"g_out_weight is required when C_out ({C_out}) != C ({C})"
+            )
+        out_gate_proj = x_in + g_out_bias if g_out_bias is not None else x_in
+
+    out = torch.sigmoid(out_gate_proj) * out_proj
+    return out.to(orig_dtype)
 
 
 def triangle_multiplicative_update(
@@ -222,7 +528,9 @@ def triangle_multiplicative_update(
     g_out_weight: Optional[torch.Tensor] = None,
     g_out_bias: Optional[torch.Tensor] = None,
     eps: float = 1e-5,
-    precision: Optional[TriMulPrecision] = None,
+    precision: Optional[TriMulPrecision | str] = None,
+    *,
+    use_fallback: bool = False,
 ) -> torch.Tensor:
     """Apply triangle multiplicative update operation.
 
@@ -273,6 +581,8 @@ def triangle_multiplicative_update(
               the operation (the LayerNorms then read BF16 values). The rounding is differentiable,
               so gradients reach FP32 parameters. Under BF16 autocast with precision None, the
               LayerNorms read the FP32 pair and only the matrix multiplications use BF16.
+        use_fallback (bool, optional): If True, force the pure-PyTorch reference
+            fallback even when CUDA kernels are available. Defaults to False.
 
     Returns:
         Output tensor of shape (B, N, N, C)
@@ -310,13 +620,13 @@ def triangle_multiplicative_update(
         torch.Size([1, 128, 128, 128])
         torch.Size([1, 128, 128, 128])
     """
-    try:
-        from cuequivariance_ops_torch import triangle_multiplicative_update as f
-    except Exception:
-        raise ImportError(
-            "Error importing triangle_multiplicative_update from cuequivariance_ops_torch."
+    if direction not in ("outgoing", "incoming"):
+        raise ValueError(
+            f"direction must be either 'outgoing' or 'incoming', got {direction!r}"
         )
-    else:
+
+    f = _get_ops_backend("triangle_multiplicative_update", x.is_cuda, use_fallback)
+    if f is not None:
         return f(
             x,
             direction,
@@ -336,6 +646,175 @@ def triangle_multiplicative_update(
             eps=eps,
             precision=precision,
         )
+    return _triangle_multiplicative_update_fallback(
+        x,
+        direction=direction,
+        mask=mask,
+        norm_in_weight=norm_in_weight,
+        norm_in_bias=norm_in_bias,
+        p_in_weight=p_in_weight,
+        p_in_bias=p_in_bias,
+        g_in_weight=g_in_weight,
+        g_in_bias=g_in_bias,
+        norm_out_weight=norm_out_weight,
+        norm_out_bias=norm_out_bias,
+        p_out_weight=p_out_weight,
+        p_out_bias=p_out_bias,
+        g_out_weight=g_out_weight,
+        g_out_bias=g_out_bias,
+        eps=eps,
+        precision=precision,
+    )
+
+
+def _attention_pair_bias_fallback(
+    single_repr: torch.Tensor,
+    pair_repr: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    num_heads: int,
+    w_ln_a: torch.Tensor,
+    b_ln_a: Optional[torch.Tensor],
+    w_proj_q: torch.Tensor,
+    b_proj_q: Optional[torch.Tensor],
+    w_proj_k: torch.Tensor,
+    w_proj_v: torch.Tensor,
+    w_proj_g: torch.Tensor,
+    w_proj_o: torch.Tensor,
+    w_proj_z: Optional[torch.Tensor] = None,
+    b_proj_o: Optional[torch.Tensor] = None,
+    b_proj_z: Optional[torch.Tensor] = None,
+    w_ln_z: Optional[torch.Tensor] = None,
+    b_ln_z: Optional[torch.Tensor] = None,
+    inf: float = 1e6,
+    eps: float = 1e-5,
+    attn_scale: Optional[float] = None,
+    return_z_proj: bool = False,
+    is_cached_z_proj: bool = False,
+    *,
+    b_proj_k: Optional[torch.Tensor] = None,
+    b_proj_v: Optional[torch.Tensor] = None,
+    w_ln_q: Optional[torch.Tensor] = None,
+    b_ln_q: Optional[torch.Tensor] = None,
+    w_ln_k: Optional[torch.Tensor] = None,
+    b_ln_k: Optional[torch.Tensor] = None,
+    b_proj_g: Optional[torch.Tensor] = None,
+    norm_kind: str = "layer_norm",
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if single_repr.ndim != 3:
+        raise ValueError(
+            f"attention_pair_bias: expected single_repr of shape (B * M, N, D), "
+            f"got {tuple(single_repr.shape)}"
+        )
+    BM, N, _ = single_repr.shape
+    H = num_heads
+    if H <= 0:
+        raise ValueError(f"attention_pair_bias: num_heads must be positive, got {H}")
+
+    if is_cached_z_proj:
+        if pair_repr.ndim != 4 or pair_repr.shape[1:] != (H, N, N):
+            raise ValueError(
+                f"attention_pair_bias: with is_cached_z_proj=True, expected pair_repr "
+                f"of shape (B, {H}, {N}, {N}), got {tuple(pair_repr.shape)}"
+            )
+    else:
+        if pair_repr.ndim != 4 or pair_repr.shape[1:3] != (N, N):
+            raise ValueError(
+                f"attention_pair_bias: expected pair_repr of shape (B, {N}, {N}, z_dim), "
+                f"got {tuple(pair_repr.shape)}"
+            )
+
+    B = pair_repr.shape[0]
+    if B <= 0 or BM % B != 0:
+        raise ValueError(
+            f"attention_pair_bias: single_repr first dim ({BM}) must be divisible by "
+            f"pair_repr batch dim ({B})"
+        )
+    M = BM // B
+
+    a_norm = _apply_norm(single_repr, w_ln_a, b_ln_a, eps, norm_kind)
+    q = F.linear(a_norm, w_proj_q, b_proj_q)
+    k = F.linear(a_norm, w_proj_k, b_proj_k)
+    v = F.linear(a_norm, w_proj_v, b_proj_v)
+    g = torch.sigmoid(F.linear(a_norm, w_proj_g, b_proj_g))
+
+    if w_ln_q is not None or b_ln_q is not None:
+        q = _apply_norm(q, w_ln_q, b_ln_q, eps, norm_kind)
+    if w_ln_k is not None or b_ln_k is not None:
+        k = _apply_norm(k, w_ln_k, b_ln_k, eps, norm_kind)
+
+    inner = q.shape[-1]
+    if inner % H != 0:
+        raise ValueError(
+            f"attention_pair_bias: projected inner dim ({inner}) must be divisible by "
+            f"num_heads ({H})"
+        )
+    DH = inner // H
+
+    q_heads = q.view(B, M, N, H, DH).permute(0, 1, 3, 2, 4)
+    k_heads = k.view(B, M, N, H, DH).permute(0, 1, 3, 2, 4)
+    v_heads = v.view(B, M, N, H, DH).permute(0, 1, 3, 2, 4)
+
+    if is_cached_z_proj:
+        z_proj = pair_repr
+    else:
+        assert w_proj_z is not None
+        z_in = (
+            _apply_norm(pair_repr, w_ln_z, b_ln_z, eps, norm_kind)
+            if (w_ln_z is not None or b_ln_z is not None)
+            else pair_repr
+        )
+        z_proj = F.linear(z_in, w_proj_z, b_proj_z).permute(0, 3, 1, 2).contiguous()
+
+    scale = 1.0 / math.sqrt(DH) if attn_scale is None else float(attn_scale)
+    acc_dtype = (
+        torch.float64
+        if (single_repr.dtype == torch.float64 or pair_repr.dtype == torch.float64)
+        else torch.float32
+    )
+    q_acc = q_heads.to(acc_dtype)
+    k_acc = k_heads.to(acc_dtype)
+    v_acc = v_heads.to(acc_dtype)
+
+    scores = torch.matmul(q_acc * scale, k_acc.transpose(-2, -1)) + z_proj.to(
+        acc_dtype
+    ).unsqueeze(1)
+
+    if mask is not None:
+        if mask.shape == (B, N):
+            valid_mask = (mask != 0).view(B, 1, 1, 1, N)
+        elif mask.shape == (BM, N):
+            valid_mask = (mask != 0).view(B, M, 1, 1, N)
+        else:
+            raise ValueError(
+                f"attention_pair_bias: expected mask of shape ({B}, {N}) or "
+                f"({BM}, {N}), got {tuple(mask.shape)}"
+            )
+        if N == 0:
+            attn = torch.zeros_like(scores)
+        else:
+            any_valid = valid_mask.any(dim=-1, keepdim=True)
+            safe_scores = torch.where(
+                valid_mask,
+                scores,
+                torch.where(
+                    any_valid,
+                    torch.full_like(scores, -float(inf)),
+                    torch.zeros_like(scores),
+                ),
+            )
+            attn = torch.where(
+                any_valid,
+                torch.softmax(safe_scores, dim=-1),
+                torch.zeros_like(scores),
+            )
+    else:
+        attn = torch.softmax(scores, dim=-1) if N > 0 else torch.zeros_like(scores)
+
+    attn_out = torch.matmul(attn, v_acc).to(single_repr.dtype)
+    attn_flat = attn_out.permute(0, 1, 3, 2, 4).reshape(BM, N, inner)
+    output = F.linear(g * attn_flat, w_proj_o, b_proj_o)
+
+    return output, (z_proj if return_z_proj else None)
 
 
 def attention_pair_bias(
@@ -370,7 +849,8 @@ def attention_pair_bias(
     b_ln_k: Optional[torch.Tensor] = None,
     b_proj_g: Optional[torch.Tensor] = None,
     norm_kind: str = "layer_norm",
-):
+    use_fallback: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Compute attention with a pairwise bias.
 
     Normalizes the single and pair representations according to ``norm_kind``,
@@ -432,6 +912,8 @@ def attention_pair_bias(
         norm_kind: Normalization applied to the single, optional Q/K, and pair
             representations. ``"layer_norm"`` preserves the existing behavior;
             ``"rms_norm"`` requires every normalization bias to be ``None``.
+        use_fallback: If True, force the pure-PyTorch reference fallback even when
+            CUDA kernels are available. Defaults to False.
 
     Returns:
         - output (torch.Tensor): Attention output of shape (B * M, N, D) with the
@@ -451,14 +933,20 @@ def attention_pair_bias(
 
     if w_proj_z is None and not is_cached_z_proj:
         raise ValueError("w_proj_z is required unless is_cached_z_proj=True")
+    if norm_kind not in ("layer_norm", "rms_norm"):
+        raise ValueError(
+            f"Unsupported norm_kind: {norm_kind!r}. Expected 'layer_norm' or 'rms_norm'."
+        )
+    if norm_kind == "rms_norm" and any(
+        b is not None for b in (b_ln_a, b_ln_z, b_ln_q, b_ln_k)
+    ):
+        raise ValueError(
+            "norm_kind='rms_norm' requires all normalization biases "
+            "(b_ln_a, b_ln_z, b_ln_q, b_ln_k) to be None"
+        )
 
-    try:
-        from cuequivariance_ops_torch import attention_pair_bias as f
-    except Exception as error:
-        raise ImportError(
-            "Error importing attention_pair_bias from cuequivariance_ops_torch."
-        ) from error
-    else:
+    f = _get_ops_backend("attention_pair_bias", single_repr.is_cuda, use_fallback)
+    if f is not None:
         norm_kind_kwargs = {} if norm_kind == "layer_norm" else {"norm_kind": norm_kind}
         return f(
             single_repr,
@@ -492,3 +980,36 @@ def attention_pair_bias(
             b_proj_g=b_proj_g,
             **norm_kind_kwargs,
         )
+
+    return _attention_pair_bias_fallback(
+        single_repr,
+        pair_repr,
+        mask,
+        num_heads,
+        w_ln_a,
+        b_ln_a,
+        w_proj_q,
+        b_proj_q,
+        w_proj_k,
+        w_proj_v,
+        w_proj_g,
+        w_proj_o,
+        w_proj_z=w_proj_z,
+        b_proj_o=b_proj_o,
+        b_proj_z=b_proj_z,
+        w_ln_z=w_ln_z,
+        b_ln_z=b_ln_z,
+        inf=inf,
+        eps=eps,
+        attn_scale=attn_scale,
+        return_z_proj=return_z_proj,
+        is_cached_z_proj=is_cached_z_proj,
+        b_proj_k=b_proj_k,
+        b_proj_v=b_proj_v,
+        w_ln_q=w_ln_q,
+        b_ln_q=b_ln_q,
+        w_ln_k=w_ln_k,
+        b_ln_k=b_ln_k,
+        b_proj_g=b_proj_g,
+        norm_kind=norm_kind,
+    )
