@@ -12,12 +12,13 @@ Demonstrates:
 
 from __future__ import annotations
 
-import cuequivariance as cue
-import cuequivariance_torch as cuet
 import numpy as np
 import torch
-from cuequivariance import descriptors
 from cuequivariance.group_theory.experimental import escn
+
+import cuequivariance as cue
+import cuequivariance_torch as cuet
+from cuequivariance import descriptors
 
 
 def section(title: str) -> None:

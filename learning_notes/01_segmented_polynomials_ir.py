@@ -12,13 +12,19 @@ Demonstrates:
 
 from __future__ import annotations
 
+import logging
 import math
+
+import numpy as np
+import torch
 
 import cuequivariance as cue
 import cuequivariance_torch as cuet
-import numpy as np
-import torch
 from cuequivariance import descriptors
+
+logging.getLogger(
+    "cuequivariance_torch.primitives.segmented_polynomial_naive"
+).setLevel(logging.ERROR)
 
 
 def section(title: str) -> None:

@@ -13,15 +13,22 @@ Demonstrates:
 
 from __future__ import annotations
 
-import cuequivariance as cue
-import cuequivariance_torch as cuet
+import logging
+
 import numpy as np
 import scipy.spatial.transform
 import torch
-from cuequivariance import descriptors
 from cuequivariance.group_theory.descriptors.spherical_harmonics_ import (
     sympy_spherical_harmonics,
 )
+
+import cuequivariance as cue
+import cuequivariance_torch as cuet
+from cuequivariance import descriptors
+
+logging.getLogger(
+    "cuequivariance_torch.primitives.segmented_polynomial_naive"
+).setLevel(logging.ERROR)
 
 
 def section(title: str) -> None:
@@ -123,8 +130,8 @@ def audit_zero_vector_derivatives() -> None:
             f"max|g2|={float(g2_safe.detach().float().abs().max()):.1f}"
         )
         assert torch.isfinite(g1_safe).all() and torch.isfinite(g2_safe).all()
-        assert float(g1_safe.float().abs().max()) == 0.0
-        assert float(g2_safe.float().abs().max()) == 0.0
+        assert float(g1_safe.detach().float().abs().max()) == 0.0
+        assert float(g2_safe.detach().float().abs().max()) == 0.0
 
 
 if __name__ == "__main__":
