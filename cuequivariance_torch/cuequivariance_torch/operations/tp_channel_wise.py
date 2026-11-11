@@ -192,6 +192,7 @@ class ChannelWiseTensorProduct(torch.nn.Module):
         indices_2: Optional[torch.Tensor] = None,
         indices_out: Optional[torch.Tensor] = None,
         size_out: Optional[int] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Perform the forward pass of the channel-wise tensor product operation.
@@ -206,6 +207,8 @@ class ChannelWiseTensorProduct(torch.nn.Module):
             indices_2 (torch.Tensor, optional): Indices to gather elements for the second operand.
             indices_out (torch.Tensor, optional): Indices to scatter elements for the output.
             size_out (int, optional): Batch dimension of the output. Needed if indices_out are provided.
+            mask (torch.Tensor, optional): Optional 1D boolean mask indicating valid edge/batch entries
+                for fixed-capacity execution.
 
         Returns:
             torch.Tensor:
@@ -234,7 +237,11 @@ class ChannelWiseTensorProduct(torch.nn.Module):
                     "size_out should be provided if indices_out is provided"
                 )
             else:
-                sizes_out = {0: torch.empty(size_out, 1).to(x1.device)}
+                sizes_out = {
+                    0: torch.empty((1, 1), device=x1.device, dtype=x1.dtype).expand(
+                        size_out, 1
+                    )
+                }
         else:
             sizes_out: Dict[int, torch.Tensor] = {}
 
@@ -249,10 +256,30 @@ class ChannelWiseTensorProduct(torch.nn.Module):
                     "Internal weights are not used, weight should not be None"
                 )
 
-        output = self.f(
-            [weight, x1, x2],
-            input_indices=indices_in,
-            output_shapes=sizes_out,
-            output_indices=dict_indices_out,
-        )
+        if (
+            x1.ndim == 1
+            and x2.ndim == 1
+            and len(indices_in) == 0
+            and len(dict_indices_out) == 0
+            and self.shared_weights
+            and weight.ndim == 2
+            and weight.shape[0] == 1
+        ):
+            weight = weight.squeeze(0)
+
+        if mask is None:
+            output = self.f(
+                [weight, x1, x2],
+                input_indices=indices_in,
+                output_shapes=sizes_out,
+                output_indices=dict_indices_out,
+            )
+        else:
+            output = self.f(
+                [weight, x1, x2],
+                input_indices=indices_in,
+                output_shapes=sizes_out,
+                output_indices=dict_indices_out,
+                mask=mask,
+            )
         return self.transpose_out(output[0])

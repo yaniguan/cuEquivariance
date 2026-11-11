@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 from cuequivariance.group_theory.irreps_array.misc_ui import (
@@ -168,6 +168,11 @@ class FullyConnectedTensorProduct(torch.nn.Module):
         x1: torch.Tensor,
         x2: torch.Tensor,
         weight: Optional[torch.Tensor] = None,
+        indices_1: Optional[torch.Tensor] = None,
+        indices_2: Optional[torch.Tensor] = None,
+        indices_out: Optional[torch.Tensor] = None,
+        size_out: Optional[int] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Perform the forward pass of the fully connected tensor product operation.
@@ -178,6 +183,12 @@ class FullyConnectedTensorProduct(torch.nn.Module):
             weight (torch.Tensor, optional): Weights for the tensor product. It should have the shape (batch_size, weight_numel)
                 if shared_weights is False, or (weight_numel,) if shared_weights is True.
                 If None, the internal weights are used.
+            indices_1 (torch.Tensor, optional): Indices to gather elements for the first operand.
+            indices_2 (torch.Tensor, optional): Indices to gather elements for the second operand.
+            indices_out (torch.Tensor, optional): Indices to scatter elements for the output.
+            size_out (int, optional): Batch dimension of the output. Needed if indices_out are provided.
+            mask (torch.Tensor, optional): Optional 1D boolean mask indicating valid edge/batch entries
+                for fixed-capacity execution.
 
         Returns:
             torch.Tensor:
@@ -187,21 +198,72 @@ class FullyConnectedTensorProduct(torch.nn.Module):
         Raises:
             ValueError: If internal weights are used and weight is not None,
                 or if shared weights are used and weight is not a 1D tensor,
-                or if shared weights are not used and weight is not a 2D tensor.
+                or if shared weights are not used and weight is not a 2D tensor,
+                or if size_out is not provided and indices_out is provided.
         """
         x1 = self.transpose_in1(x1)
         x2 = self.transpose_in2(x2)
 
+        indices_in: Dict[int, torch.Tensor] = {}
+        if indices_1 is not None:
+            indices_in[1] = indices_1
+        if indices_2 is not None:
+            indices_in[2] = indices_2
+        dict_indices_out: Dict[int, torch.Tensor] = {}
+        if indices_out is not None:
+            dict_indices_out = {0: indices_out}
+            if size_out is None:
+                raise ValueError(
+                    "size_out should be provided if indices_out is provided"
+                )
+            else:
+                sizes_out = {
+                    0: torch.empty((1, 1), device=x1.device, dtype=x1.dtype).expand(
+                        size_out, 1
+                    )
+                }
+        else:
+            sizes_out: Dict[int, torch.Tensor] = {}
+
         if self.weight is not None:
             if weight is not None:
                 raise ValueError("Internal weights are used, weight should be None")
-            output = self.f([self.weight, x1, x2])
+            else:
+                weight = self.weight
         else:
             if weight is None:
                 raise ValueError(
                     "Internal weights are not used, weight should not be None"
                 )
-            else:
-                output = self.f([weight, x1, x2])
+
+        if (
+            x1.ndim == 1
+            and x2.ndim == 1
+            and len(indices_in) == 0
+            and len(dict_indices_out) == 0
+            and self.shared_weights
+            and weight.ndim == 2
+            and weight.shape[0] == 1
+        ):
+            weight = weight.squeeze(0)
+
+        has_indices = len(indices_in) > 0 or len(dict_indices_out) > 0
+        if not has_indices and mask is None:
+            output = self.f([weight, x1, x2])
+        elif mask is None:
+            output = self.f(
+                [weight, x1, x2],
+                input_indices=indices_in,
+                output_shapes=sizes_out,
+                output_indices=dict_indices_out,
+            )
+        else:
+            output = self.f(
+                [weight, x1, x2],
+                input_indices=indices_in,
+                output_shapes=sizes_out,
+                output_indices=dict_indices_out,
+                mask=mask,
+            )
 
         return self.transpose_out(output[0])

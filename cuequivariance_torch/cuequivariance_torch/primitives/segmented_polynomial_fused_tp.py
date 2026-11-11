@@ -222,7 +222,7 @@ class SegmentedPolynomialFusedTP(nn.Module):
         for size in input_batch_sizes:
             if size != 1:
                 assert batch_size in [1, size]
-            batch_size = size
+                batch_size = size
         outputs_dims = [
             (batch_size, shape)
             if i not in output_shapes.keys()
@@ -245,7 +245,7 @@ class SegmentedPolynomialFusedTP(nn.Module):
                 # In case we need to replicate before scattering:
                 if out.shape[0] == 1 and out_indices[b_out].shape[0] > 1:
                     out = out.expand(out_indices[b_out].shape[0], out.shape[1])
-                inds = out_indices[b_out].unsqueeze(-1).expand_as(out)
+                inds = out_indices[b_out].to(torch.int64).unsqueeze(-1).expand_as(out)
                 out_buffers[b_out].scatter_add_(0, inds, out)
             else:
                 if out_buffers[b_out].shape[0] == out.shape[0]:

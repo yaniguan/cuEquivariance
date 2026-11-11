@@ -410,7 +410,7 @@ class SegmentedPolynomialNaive(nn.Module):
                 # In case we need to replicate before scattering:
                 if out.shape[0] == 1 and out_indices[b_out].shape[0] > 1:
                     out = out.expand(out_indices[b_out].shape[0], out.shape[1])
-                inds = out_indices[b_out].unsqueeze(-1).expand_as(out)
+                inds = out_indices[b_out].to(torch.int64).unsqueeze(-1).expand_as(out)
                 tmp_out = torch.zeros(
                     outputs_dims[b_out],
                     dtype=inputs[self.dtypes[b_out]].dtype,
