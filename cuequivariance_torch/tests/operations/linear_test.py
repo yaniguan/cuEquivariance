@@ -14,6 +14,9 @@
 # limitations under the License.
 
 import copy
+import sys
+import types
+import warnings
 
 import pytest
 import torch
@@ -329,3 +332,361 @@ def test_linear_fwd_methods(
     y = linear(x, pre_indexed_weights)
 
     torch.testing.assert_close(y_ind, y)
+
+
+def _install_mock_cue_ops(monkeypatch):
+    """Install a lightweight mock cuequivariance_ops_torch for CPU-only testing."""
+
+    class _MockFusedTensorProductOp3(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.kwargs = kwargs
+
+        def forward(self, x0, x1):
+            return x0.new_zeros((max(x0.shape[0], x1.shape[0]), 1))
+
+    def _mock_indexed_linear(w, x, counts, u, v, C, Zw, subscripts, coefficients):
+        lhs_sub, rhs_sub, out_sub = subscripts
+        formula = f"{lhs_sub},n{rhs_sub}->n{out_sub}"
+        chunks = []
+        offset = 0
+        coeff = coefficients.to(dtype=w.dtype)
+        for c in range(C):
+            cnt = int(counts[c].item())
+            x_c = x[offset : offset + cnt]
+            offset += cnt
+            chunks.append(coeff * torch.einsum(formula, w[c], x_c))
+        return torch.cat(chunks, dim=0) if chunks else x.new_zeros((0, v))
+
+    mock_mod = types.ModuleType("cuequivariance_ops_torch")
+    mock_mod.FusedTensorProductOp3 = _MockFusedTensorProductOp3
+    mock_mod.indexed_linear = _mock_indexed_linear
+    monkeypatch.setitem(sys.modules, "cuequivariance_ops_torch", mock_mod)
+    monkeypatch.setattr(cuet.primitives.segmented_polynomial, "HAS_CUE_OPS", True)
+
+
+@pytest.mark.parametrize(
+    "dtype, expected_math_dtype",
+    [
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float32),
+        (torch.float64, torch.float64),
+        (None, torch.float32),
+    ],
+)
+def test_linear_fused_tp_math_dtype_promotion(
+    dtype: torch.dtype | None,
+    expected_math_dtype: torch.dtype,
+    monkeypatch,
+):
+    irreps_in = cue.Irreps("O3", "3x0e + 2x1o")
+    irreps_out = cue.Irreps("O3", "2x0e + 4x1o")
+
+    # 1. Direct construction in the current environment (real GPU or fallback)
+    lin_direct = cuet.Linear(
+        irreps_in,
+        irreps_out,
+        layout=cue.ir_mul,
+        device=device if torch.cuda.is_available() else None,
+        dtype=dtype,
+        method="fused_tp",
+    )
+    assert lin_direct.f._math_dtype_orig == expected_math_dtype
+    if (
+        torch.cuda.is_available()
+        and cuet.primitives.segmented_polynomial.HAS_CUE_OPS
+        and dtype is not None
+    ):
+        x = torch.randn(8, irreps_in.dim, device=device, dtype=dtype)
+        y = lin_direct(x)
+        assert y.shape == (8, irreps_out.dim)
+        assert y.dtype == dtype
+
+    # 2. Mocked HAS_CUE_OPS=True to exercise SegmentedPolynomialFusedTP.__init__ directly
+    _install_mock_cue_ops(monkeypatch)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        lin = cuet.Linear(
+            irreps_in,
+            irreps_out,
+            layout=cue.ir_mul,
+            dtype=dtype,
+            method="fused_tp",
+        )
+    assert len(caught) == 0
+    assert lin.method == "fused_tp"
+    assert lin.f.method == "fused_tp"
+    assert lin.f.m.math_dtype == expected_math_dtype
+
+    # Explicit math_dtype override must still be respected
+    lin_override = cuet.Linear(
+        irreps_in,
+        irreps_out,
+        layout=cue.ir_mul,
+        dtype=torch.bfloat16,
+        math_dtype=torch.float64,
+        method="fused_tp",
+    )
+    assert lin_override.f.m.math_dtype == torch.float64
+
+    # Deepcopy must preserve math_dtype without warnings or errors
+    lin_copy = copy.deepcopy(lin)
+    assert lin_copy.f.m.math_dtype == expected_math_dtype
+
+
+@pytest.mark.parametrize(
+    "dtype, expected_math_dtype",
+    [
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float32),
+        (torch.float64, torch.float64),
+    ],
+)
+def test_linear_auto_backend_gpu_vs_cpu(
+    dtype: torch.dtype,
+    expected_math_dtype: torch.dtype,
+    monkeypatch,
+):
+    irreps_in = cue.Irreps("O3", "4x0e + 2x1o")
+    irreps_out = cue.Irreps("O3", "2x0e + 3x1o")
+
+    # Case 1: GPU available + HAS_CUE_OPS=True -> auto-selects "fused_tp" cleanly
+    _install_mock_cue_ops(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    with warnings.catch_warnings(record=True) as caught_gpu:
+        warnings.simplefilter("always")
+        lin_gpu = cuet.Linear(
+            irreps_in,
+            irreps_out,
+            layout=cue.ir_mul,
+            dtype=dtype,
+        )
+    assert len(caught_gpu) == 0
+    assert lin_gpu.method == "fused_tp"
+    assert lin_gpu.f.method == "fused_tp"
+    assert lin_gpu.f.m.math_dtype == expected_math_dtype
+
+    # Case 2: GPU available + HAS_CUE_OPS=True + explicit device="cpu" -> "naive", 0 warnings
+    with warnings.catch_warnings(record=True) as caught_cpu_explicit:
+        warnings.simplefilter("always")
+        lin_cpu_explicit = cuet.Linear(
+            irreps_in,
+            irreps_out,
+            layout=cue.ir_mul,
+            device=torch.device("cpu"),
+            dtype=dtype,
+        )
+    assert len(caught_cpu_explicit) == 0
+    assert lin_cpu_explicit.method == "naive"
+    assert lin_cpu_explicit.f.method == "naive"
+
+    # Case 3: CPU-only (cuda not available) + HAS_CUE_OPS=True -> "naive", 0 warnings
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with warnings.catch_warnings(record=True) as caught_no_cuda:
+        warnings.simplefilter("always")
+        lin_no_cuda = cuet.Linear(
+            irreps_in,
+            irreps_out,
+            layout=cue.ir_mul,
+            dtype=dtype,
+        )
+    assert len(caught_no_cuda) == 0
+    assert lin_no_cuda.method == "naive"
+    assert lin_no_cuda.f.method == "naive"
+
+    # Case 4: GPU available + HAS_CUE_OPS=False -> "naive", 0 fallback warnings
+    monkeypatch.setattr(cuet.primitives.segmented_polynomial, "HAS_CUE_OPS", False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    with warnings.catch_warnings(record=True) as caught_no_ops:
+        warnings.simplefilter("always")
+        lin_no_ops = cuet.Linear(
+            irreps_in,
+            irreps_out,
+            layout=cue.ir_mul,
+            dtype=dtype,
+        )
+    assert len(caught_no_ops) == 0
+    assert lin_no_ops.method == "naive"
+    assert lin_no_ops.f.method == "naive"
+
+
+@pytest.mark.parametrize("layout", [cue.mul_ir, cue.ir_mul])
+@pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("internal_weights", [True, False])
+def test_linear_indexed_auto_sort_indices(
+    layout: cue.IrrepsLayout,
+    idx_dtype: torch.dtype,
+    internal_weights: bool,
+    monkeypatch,
+):
+    use_real_cuda = (
+        torch.cuda.is_available() and cuet.primitives.segmented_polynomial.HAS_CUE_OPS
+    )
+    if not use_real_cuda:
+        _install_mock_cue_ops(monkeypatch)
+    run_device = device if use_real_cuda else torch.device("cpu")
+
+    irreps_in = cue.Irreps("O3", "4x0e + 4x1o + 9x2e")
+    irreps_out = cue.Irreps("O3", "3x0e + 5x1o + 2x2e")
+    weight_classes = 5
+
+    # Ensure SegmentedPolynomialIndexedLinear registers FP64 coefficients when constructed
+    prev_default = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        lin_idx = cuet.Linear(
+            irreps_in,
+            irreps_out,
+            layout=layout,
+            shared_weights=True,
+            internal_weights=internal_weights,
+            weight_classes=weight_classes,
+            device=run_device,
+            dtype=torch.float64,
+            method="indexed_linear",
+        )
+        lin_idx_no_sort = cuet.Linear(
+            irreps_in,
+            irreps_out,
+            layout=layout,
+            shared_weights=True,
+            internal_weights=internal_weights,
+            weight_classes=weight_classes,
+            auto_sort_indices=False,
+            device=run_device,
+            dtype=torch.float64,
+            method="indexed_linear",
+        )
+        lin_ref = cuet.Linear(
+            irreps_in,
+            irreps_out,
+            layout=layout,
+            shared_weights=True,
+            internal_weights=internal_weights,
+            weight_classes=weight_classes,
+            device=run_device,
+            dtype=torch.float64,
+            method="naive",
+        )
+    finally:
+        torch.set_default_dtype(prev_default)
+
+    assert isinstance(
+        lin_idx.f.m,
+        cuet.primitives.segmented_polynomial_indexed_linear.SegmentedPolynomialIndexedLinear,
+    )
+
+    # Unsorted species indices (note class 1 is absent, classes 0/2/3/4 repeated out of order)
+    raw_indices = [4, 0, 2, 4, 3, 0, 2, 0, 4, 3, 2]
+    idx = torch.tensor(raw_indices, dtype=idx_dtype, device=run_device)
+    idx_orig = idx.clone()
+
+    torch.manual_seed(42)
+    x_idx = torch.randn(
+        len(raw_indices),
+        irreps_in.dim,
+        dtype=torch.float64,
+        device=run_device,
+        requires_grad=True,
+    )
+    x_ref = x_idx.detach().clone().requires_grad_(True)
+
+    if internal_weights:
+        with torch.no_grad():
+            lin_ref.weight.copy_(lin_idx.weight)
+            lin_idx_no_sort.weight.copy_(lin_idx.weight)
+        w_idx = None
+        w_ref = None
+        diff_idx = (x_idx, lin_idx.weight)
+        diff_ref = (x_ref, lin_ref.weight)
+    else:
+        w_idx = torch.randn(
+            weight_classes,
+            lin_idx.weight_numel,
+            dtype=torch.float64,
+            device=run_device,
+            requires_grad=True,
+        )
+        w_ref = w_idx.detach().clone().requires_grad_(True)
+        diff_idx = (x_idx, w_idx)
+        diff_ref = (x_ref, w_ref)
+
+    # With auto_sort_indices=False, unsorted indices fail as before
+    with pytest.raises(AssertionError, match="non-sorted indices"):
+        lin_idx_no_sort(x_idx, weight=w_idx, weight_indices=idx)
+
+    # With auto_sort_indices=True (default), unsorted indices succeed without mutating idx
+    y_idx = lin_idx(x_idx, weight=w_idx, weight_indices=idx)
+    y_ref = lin_ref(x_ref, weight=w_ref, weight_indices=idx)
+    assert torch.equal(idx, idx_orig)
+    torch.testing.assert_close(y_idx, y_ref, atol=1e-12, rtol=1e-12)
+
+    # 1st backward (create_graph=True)
+    cotangent = torch.randn_like(y_ref)
+    loss_idx = (y_idx * cotangent).pow(2).sum()
+    loss_ref = (y_ref * cotangent).pow(2).sum()
+    gx_idx, gw_idx = torch.autograd.grad(loss_idx, diff_idx, create_graph=True)
+    gx_ref, gw_ref = torch.autograd.grad(loss_ref, diff_ref, create_graph=True)
+    torch.testing.assert_close(gx_idx, gx_ref, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(gw_idx, gw_ref, atol=1e-12, rtol=1e-12)
+
+    # 2nd backward
+    v_x = torch.randn_like(gx_ref)
+    v_w = torch.randn_like(gw_ref)
+    ggx_idx, ggw_idx = torch.autograd.grad(
+        (gx_idx * v_x).sum() + (gw_idx * v_w).sum(), diff_idx
+    )
+    ggx_ref, ggw_ref = torch.autograd.grad(
+        (gx_ref * v_x).sum() + (gw_ref * v_w).sum(), diff_ref
+    )
+    torch.testing.assert_close(ggx_idx, ggx_ref, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(ggw_idx, ggw_ref, atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.parametrize(
+    "irreps_in_str, irreps_out_str",
+    [
+        ("2x0e", "2x1o"),
+        ("0x0e", "2x0e"),
+        ("2x0e", "0x1o"),
+        ("", ""),
+    ],
+)
+@pytest.mark.parametrize("layout", [cue.mul_ir, cue.ir_mul])
+def test_linear_disjoint_and_empty_irreps(
+    irreps_in_str: str,
+    irreps_out_str: str,
+    layout: cue.IrrepsLayout,
+):
+    irreps_in = cue.Irreps("O3", irreps_in_str)
+    irreps_out = cue.Irreps("O3", irreps_out_str)
+
+    lin = cuet.Linear(
+        irreps_in,
+        irreps_out,
+        layout=layout,
+        device=device,
+        dtype=torch.float64,
+    )
+    assert lin.weight_numel == 0
+    assert lin.method == "naive"
+
+    x = torch.randn(
+        6, irreps_in.dim, device=device, dtype=torch.float64, requires_grad=True
+    )
+    y = lin(x)
+    assert y.shape == (6, irreps_out.dim)
+    assert torch.all(y == 0)
+
+    gx, gw = torch.autograd.grad(y.pow(2).sum(), (x, lin.weight), create_graph=True)
+    ggx, ggw = torch.autograd.grad(gx.sum() + gw.sum(), (x, lin.weight))
+    assert torch.all(gx == 0)
+    assert torch.all(gw == 0)
+    assert torch.all(ggx == 0)
+    assert torch.all(ggw == 0)
+
+    scripted = torch.jit.script(lin)
+    torch.testing.assert_close(scripted(x.detach()), y.detach())
+    copy.deepcopy(lin)
