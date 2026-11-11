@@ -23,34 +23,36 @@ __version__ = (
     importlib.resources.files(__package__).joinpath("VERSION").read_text().strip()
 )
 
-from .primitives.transpose import TransposeSegments, TransposeIrrepsLayout
-from .primitives.segmented_polynomial import SegmentedPolynomial
-from .primitives.deprecated import (
-    TensorProduct,
-    EquivariantTensorProduct,
-    SymmetricTensorProduct,
-    IWeightedSymmetricTensorProduct,
-)
-from .operations.tp_channel_wise import ChannelWiseTensorProduct
-from .operations.tp_fully_connected import FullyConnectedTensorProduct
+from cuequivariance_torch import layers, operations
+
+from .layers.equivariant_norm import EquivariantLayerNorm, EquivariantRMSNorm
+from .operations.gate import Gate
 from .operations.linear import Linear
-from .operations.symmetric_contraction import SymmetricContraction
 from .operations.rotation import (
+    Inversion,
     Rotation,
     encode_rotation_angle,
     vector_to_euler_angles,
-    Inversion,
 )
 from .operations.spherical_harmonics import SphericalHarmonics
+from .operations.symmetric_contraction import SymmetricContraction
+from .operations.tp_channel_wise import ChannelWiseTensorProduct
+from .operations.tp_fully_connected import FullyConnectedTensorProduct
+from .primitives.deprecated import (
+    EquivariantTensorProduct,
+    IWeightedSymmetricTensorProduct,
+    SymmetricTensorProduct,
+    TensorProduct,
+)
+from .primitives.segmented_polynomial import SegmentedPolynomial
+from .primitives.transpose import TransposeIrrepsLayout, TransposeSegments
 from .primitives.triangle import (
+    TriMulPrecision,
+    attention_pair_bias,
     mask_to_kv_lengths,
     triangle_attention,
     triangle_multiplicative_update,
-    attention_pair_bias,
-    TriMulPrecision,
 )
-
-from cuequivariance_torch import layers
 
 
 def onnx_custom_translation_table():
@@ -98,12 +100,16 @@ __all__ = [
     "vector_to_euler_angles",
     "Inversion",
     "SphericalHarmonics",
+    "Gate",
+    "EquivariantRMSNorm",
+    "EquivariantLayerNorm",
     "mask_to_kv_lengths",
     "triangle_attention",
     "triangle_multiplicative_update",
     "attention_pair_bias",
     "TriMulPrecision",
     "layers",
+    "operations",
     "onnx_custom_translation_table",
     "register_tensorrt_plugins",
 ]

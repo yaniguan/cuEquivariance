@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .batchnorm import BatchNorm
+from .equivariant_norm import EquivariantLayerNorm, EquivariantRMSNorm
 from .tp_conv_fully_connected import FullyConnectedTensorProductConv
 
 __all__ = [
     "BatchNorm",
+    "EquivariantRMSNorm",
+    "EquivariantLayerNorm",
     "FullyConnectedTensorProductConv",
 ]
